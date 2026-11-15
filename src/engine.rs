@@ -426,6 +426,92 @@ pub fn matvec_q8_0(w: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32])
     Ok(())
 }
 
+/// In-place RMSNorm: out = x / sqrt(mean(x^2) + eps) * w
+pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) -> Result<()> {
+    if x.len() != w.len() || x.len() != out.len() {
+        bail!(
+            "dimension mismatch in rmsnorm: x={}, w={}, out={}",
+            x.len(),
+            w.len(),
+            out.len()
+        );
+    }
+    if x.is_empty() {
+        return Ok(());
+    }
+    let ss: f32 = x.iter().map(|v| v * v).sum();
+    let scale = 1.0 / (ss / x.len() as f32 + eps).sqrt();
+    for i in 0..x.len() {
+        out[i] = x[i] * scale * w[i];
+    }
+    Ok(())
+}
+
+/// In-place SiLU (Swish-1) activation function: x = x / (1 + exp(-x))
+pub fn silu(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v /= 1.0 + (-*v).exp();
+    }
+}
+
+/// SwiGLU activation: out = (silu(gate) * up)
+pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) -> Result<()> {
+    if gate.len() != up.len() || gate.len() != out.len() {
+        bail!("dimension mismatch in swiglu");
+    }
+    for i in 0..gate.len() {
+        let g = gate[i] / (1.0 + (-gate[i]).exp());
+        out[i] = g * up[i];
+    }
+    Ok(())
+}
+
+/// In-place Softmax over a vector of logits with numerical stability.
+pub fn softmax(x: &mut [f32]) {
+    if x.is_empty() {
+        return;
+    }
+    let max_val = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() {
+        *v = (*v - max_val).exp();
+        sum += *v;
+    }
+    if sum > 0.0 {
+        let inv_sum = 1.0 / sum;
+        for v in x.iter_mut() {
+            *v *= inv_sum;
+        }
+    }
+}
+
+/// Rotary Position Embedding (RoPE) applied to vectors.
+pub fn apply_rope(vec: &mut [f32], pos: usize, head_dim: usize, theta_base: f32) -> Result<()> {
+    if vec.len() % head_dim != 0 {
+        bail!(
+            "vector length {} not divisible by head_dim {}",
+            vec.len(),
+            head_dim
+        );
+    }
+    if head_dim % 2 != 0 {
+        bail!("head_dim {head_dim} must be even for RoPE");
+    }
+    for head in vec.chunks_exact_mut(head_dim) {
+        for i in (0..head_dim).step_by(2) {
+            let freq = 1.0 / theta_base.powf((i as f32) / (head_dim as f32));
+            let val = pos as f32 * freq;
+            let fcr = val.cos();
+            let fci = val.sin();
+            let v0 = head[i];
+            let v1 = head[i + 1];
+            head[i] = v0 * fcr - v1 * fci;
+            head[i + 1] = v0 * fci + v1 * fcr;
+        }
+    }
+    Ok(())
+}
+
 /// Start an interactive session. Token generation is delegated to llama-cli,
 /// which runs the full transformer forward pass. Kernels in this module serve
 /// as the native path for benchmarking and for future in-process inference.
@@ -529,5 +615,34 @@ mod tests {
                 y[r]
             );
         }
+    }
+
+    #[test]
+    fn rmsnorm_normalizes_and_scales() {
+        let x = vec![2.0, -2.0, 2.0, -2.0];
+        let w = vec![1.0, 1.0, 1.0, 1.0];
+        let mut out = vec![0.0; 4];
+        rmsnorm(&x, &w, 1e-5, &mut out).unwrap();
+        // rms = sqrt((4 + 4 + 4 + 4)/4) = 2.0
+        assert!((out[0] - 1.0).abs() < 1e-4);
+        assert!((out[1] - (-1.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn softmax_sums_to_one() {
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0];
+        softmax(&mut logits);
+        let sum: f32 = logits.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+        assert!(logits[3] > logits[2] && logits[2] > logits[1] && logits[1] > logits[0]);
+    }
+
+    #[test]
+    fn rope_preserves_norm() {
+        let mut v = vec![1.0, 2.0, -1.0, 3.0];
+        let original_norm: f32 = v.iter().map(|x| x * x).sum();
+        apply_rope(&mut v, 5, 4, 10000.0).unwrap();
+        let new_norm: f32 = v.iter().map(|x| x * x).sum();
+        assert!((original_norm - new_norm).abs() < 1e-4);
     }
 }
