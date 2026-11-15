@@ -91,13 +91,13 @@ pub fn compress(
     }
     if let Ok(meta) = crate::detector::read_gguf_meta(input) {
         if let Some(ft) = meta.file_type {
-            // llama.cpp only allows quantizing from F32 (0), F16 (1), BF16 (28), or Q8_0 (7)
-            if ft != 0 && ft != 1 && ft != 28 && ft != 7 {
+            // llama.cpp strictly requires unquantized float models: F32 (0), F16 (1), or BF16 (28)
+            if ft != 0 && ft != 1 && ft != 28 {
                 let current_quant = meta.quant_name();
                 bail!(
-                    "cannot requantize already-quantized model '{}' ({current_quant}).\n\
-                     llama.cpp requires an unquantized source model (F16, BF16, or Q8_0) for quantization \
-                     because re-quantizing an already lossy format (like {current_quant}) severely degrades quality.",
+                    "cannot quantize already-quantized model '{}' ({current_quant}).\n\
+                     llama.cpp requires an unquantized source model (f16, bf16, or f32) as the input for quantization \
+                     because re-quantizing an already quantized model (like {current_quant}) severely degrades quality and is disabled by llama.cpp.",
                     input.display()
                 );
             }
