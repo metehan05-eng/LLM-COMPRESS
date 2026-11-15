@@ -72,6 +72,8 @@ pub fn init_thread_pool(threads: Option<usize>) -> Result<usize> {
 pub enum Kernel {
     #[cfg(target_arch = "x86_64")]
     Avx2Fma,
+    #[cfg(target_arch = "aarch64")]
+    Neon,
     Scalar,
 }
 
@@ -82,6 +84,10 @@ pub fn detect_kernel() -> Kernel {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return Kernel::Avx2Fma;
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return Kernel::Neon;
     }
     Kernel::Scalar
 }
@@ -168,6 +174,52 @@ unsafe fn dot_block_avx2(d: f32, qs: &[u8], x: &[f32]) -> f32 {
     d * _mm_cvtss_f32(s)
 }
 
+/// ARM NEON kernel for one Q4_0 block (32 weights against 32 activations).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_block_neon(d: f32, qs: &[u8], x: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    debug_assert!(qs.len() == 16 && x.len() == QK4_0);
+
+    let raw = vld1q_u8(qs.as_ptr());
+    let mask = vdupq_n_u8(0x0F);
+    let lo_u8 = vandq_u8(raw, mask);
+    let hi_u8 = vandq_u8(vshrq_n_u8::<4>(raw), mask);
+
+    let bias = vdupq_n_s8(8);
+    let lo_s8 = vsubq_s8(vreinterpretq_s8_u8(lo_u8), bias);
+    let hi_s8 = vsubq_s8(vreinterpretq_s8_u8(hi_u8), bias);
+
+    let mut acc = vdupq_n_f32(0.0);
+
+    let lo_s16_l = vmovl_s8(vget_low_s8(lo_s8));
+    let lo_s16_h = vmovl_high_s8(lo_s8);
+    let f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo_s16_l)));
+    let f1 = vcvtq_f32_s32(vmovl_high_s16(lo_s16_l));
+    let f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo_s16_h)));
+    let f3 = vcvtq_f32_s32(vmovl_high_s16(lo_s16_h));
+
+    acc = vfmaq_f32(acc, f0, vld1q_f32(x.as_ptr().add(0)));
+    acc = vfmaq_f32(acc, f1, vld1q_f32(x.as_ptr().add(4)));
+    acc = vfmaq_f32(acc, f2, vld1q_f32(x.as_ptr().add(8)));
+    acc = vfmaq_f32(acc, f3, vld1q_f32(x.as_ptr().add(12)));
+
+    let hi_s16_l = vmovl_s8(vget_low_s8(hi_s8));
+    let hi_s16_h = vmovl_high_s8(hi_s8);
+    let f4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi_s16_l)));
+    let f5 = vcvtq_f32_s32(vmovl_high_s16(hi_s16_l));
+    let f6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi_s16_h)));
+    let f7 = vcvtq_f32_s32(vmovl_high_s16(hi_s16_h));
+
+    acc = vfmaq_f32(acc, f4, vld1q_f32(x.as_ptr().add(16)));
+    acc = vfmaq_f32(acc, f5, vld1q_f32(x.as_ptr().add(20)));
+    acc = vfmaq_f32(acc, f6, vld1q_f32(x.as_ptr().add(24)));
+    acc = vfmaq_f32(acc, f7, vld1q_f32(x.as_ptr().add(28)));
+
+    let sum = vaddvq_f32(acc);
+    d * sum
+}
+
 /// Dot product of one Q4_0-encoded row with an f32 activation vector.
 pub fn dot_q4_0_row(row: &[u8], x: &[f32], kernel: Kernel) -> f32 {
     let mut acc = 0f32;
@@ -182,6 +234,8 @@ pub fn dot_q4_0_row(row: &[u8], x: &[f32], kernel: Kernel) -> f32 {
             // SAFETY: `Kernel::Avx2Fma` is only produced by `detect_kernel`
             // after confirming AVX2 and FMA support.
             Kernel::Avx2Fma => unsafe { dot_block_avx2(d, qs, xb) },
+            #[cfg(target_arch = "aarch64")]
+            Kernel::Neon => unsafe { dot_block_neon(d, qs, xb) },
             Kernel::Scalar => dot_block_scalar(d, qs, xb),
         };
     }
@@ -219,6 +273,154 @@ pub fn matvec_q4_0(w: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32])
     y[..rows].par_iter_mut().enumerate().for_each(|(r, out)| {
         let row_slice = &w[r * row_bytes..(r + 1) * row_bytes];
         *out = dot_q4_0_row(row_slice, &x[..cols], kernel);
+    });
+
+    Ok(())
+}
+
+fn dot_block_q8_0_scalar(d: f32, qs: &[i8], x: &[f32]) -> f32 {
+    let mut sum = 0f32;
+    for j in 0..32 {
+        sum += qs[j] as f32 * x[j];
+    }
+    d * sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_block_q8_0_avx2(d: f32, qs: &[i8], x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    debug_assert!(qs.len() == 32 && x.len() == QK8_0);
+
+    let raw = _mm256_loadu_si256(qs.as_ptr() as *const __m256i);
+    let low128 = _mm256_castsi256_si128(raw);
+    let high128 = _mm256_extracti128_si256::<1>(raw);
+
+    let i0 = _mm256_cvtepi8_epi32(low128);
+    let i1 = _mm256_cvtepi8_epi32(_mm_srli_si128::<8>(low128));
+    let i2 = _mm256_cvtepi8_epi32(high128);
+    let i3 = _mm256_cvtepi8_epi32(_mm_srli_si128::<8>(high128));
+
+    let mut acc = _mm256_setzero_ps();
+    acc = _mm256_fmadd_ps(
+        _mm256_cvtepi32_ps(i0),
+        _mm256_loadu_ps(x.as_ptr().add(0)),
+        acc,
+    );
+    acc = _mm256_fmadd_ps(
+        _mm256_cvtepi32_ps(i1),
+        _mm256_loadu_ps(x.as_ptr().add(8)),
+        acc,
+    );
+    acc = _mm256_fmadd_ps(
+        _mm256_cvtepi32_ps(i2),
+        _mm256_loadu_ps(x.as_ptr().add(16)),
+        acc,
+    );
+    acc = _mm256_fmadd_ps(
+        _mm256_cvtepi32_ps(i3),
+        _mm256_loadu_ps(x.as_ptr().add(24)),
+        acc,
+    );
+
+    let low = _mm256_castps256_ps128(acc);
+    let high = _mm256_extractf128_ps::<1>(acc);
+    let s = _mm_add_ps(low, high);
+    let s = _mm_hadd_ps(s, s);
+    let s = _mm_hadd_ps(s, s);
+    d * _mm_cvtss_f32(s)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_block_q8_0_neon(d: f32, qs: &[i8], x: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    debug_assert!(qs.len() == 32 && x.len() == QK8_0);
+
+    let raw0 = vld1q_s8(qs.as_ptr());
+    let raw1 = vld1q_s8(qs.as_ptr().add(16));
+
+    let mut acc = vdupq_n_f32(0.0);
+
+    let s16_0 = vmovl_s8(vget_low_s8(raw0));
+    let s16_1 = vmovl_high_s8(raw0);
+    let f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_0)));
+    let f1 = vcvtq_f32_s32(vmovl_high_s16(s16_0));
+    let f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_1)));
+    let f3 = vcvtq_f32_s32(vmovl_high_s16(s16_1));
+
+    acc = vfmaq_f32(acc, f0, vld1q_f32(x.as_ptr().add(0)));
+    acc = vfmaq_f32(acc, f1, vld1q_f32(x.as_ptr().add(4)));
+    acc = vfmaq_f32(acc, f2, vld1q_f32(x.as_ptr().add(8)));
+    acc = vfmaq_f32(acc, f3, vld1q_f32(x.as_ptr().add(12)));
+
+    let s16_2 = vmovl_s8(vget_low_s8(raw1));
+    let s16_3 = vmovl_high_s8(raw1);
+    let f4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_2)));
+    let f5 = vcvtq_f32_s32(vmovl_high_s16(s16_2));
+    let f6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_3)));
+    let f7 = vcvtq_f32_s32(vmovl_high_s16(s16_3));
+
+    acc = vfmaq_f32(acc, f4, vld1q_f32(x.as_ptr().add(16)));
+    acc = vfmaq_f32(acc, f5, vld1q_f32(x.as_ptr().add(20)));
+    acc = vfmaq_f32(acc, f6, vld1q_f32(x.as_ptr().add(24)));
+    acc = vfmaq_f32(acc, f7, vld1q_f32(x.as_ptr().add(28)));
+
+    let sum = vaddvq_f32(acc);
+    d * sum
+}
+
+/// Dot product of one Q8_0-encoded row with an f32 activation vector.
+pub fn dot_q8_0_row(row: &[u8], x: &[f32], kernel: Kernel) -> f32 {
+    let mut acc = 0f32;
+    for (block, xb) in row
+        .chunks_exact(Q8_0_BLOCK_BYTES)
+        .zip(x.chunks_exact(QK8_0))
+    {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs: &[i8] = unsafe { std::slice::from_raw_parts(block[2..].as_ptr() as *const i8, 32) };
+        acc += match kernel {
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Avx2Fma => unsafe { dot_block_q8_0_avx2(d, qs, xb) },
+            #[cfg(target_arch = "aarch64")]
+            Kernel::Neon => unsafe { dot_block_q8_0_neon(d, qs, xb) },
+            Kernel::Scalar => dot_block_q8_0_scalar(d, qs, xb),
+        };
+    }
+    acc
+}
+
+/// `y = W · x`, where `W` is `rows × cols` in row-major Q8_0 layout.
+/// Output rows are computed in parallel on the rayon pool.
+pub fn matvec_q8_0(w: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) -> Result<()> {
+    if cols % QK8_0 != 0 {
+        bail!("column count {cols} is not a multiple of {QK8_0}");
+    }
+    let row_bytes = cols / QK8_0 * Q8_0_BLOCK_BYTES;
+    let expected_bytes = rows * row_bytes;
+    if w.len() < expected_bytes {
+        bail!(
+            "weight buffer too short: got {}, expected at least {expected_bytes}",
+            w.len()
+        );
+    }
+    if x.len() < cols {
+        bail!(
+            "input vector too short: got {}, expected at least {cols}",
+            x.len()
+        );
+    }
+    if y.len() < rows {
+        bail!(
+            "output vector too short: got {}, expected at least {rows}",
+            y.len()
+        );
+    }
+
+    let kernel = detect_kernel();
+    y[..rows].par_iter_mut().enumerate().for_each(|(r, out)| {
+        let row_slice = &w[r * row_bytes..(r + 1) * row_bytes];
+        *out = dot_q8_0_row(row_slice, &x[..cols], kernel);
     });
 
     Ok(())
@@ -293,6 +495,34 @@ mod tests {
 
         for r in 0..rows {
             let expected = dot_q4_0_row(&w[r * row_bytes..(r + 1) * row_bytes], &x, Kernel::Scalar);
+            assert!(
+                (y[r] - expected).abs() < 1e-3,
+                "row {r}: got {}, expected {expected}",
+                y[r]
+            );
+        }
+    }
+
+    #[test]
+    fn matvec_q8_0_matches_scalar_reference() {
+        let rows = 4;
+        let cols = 64;
+        let row_bytes = cols / QK8_0 * Q8_0_BLOCK_BYTES;
+
+        let mut w = vec![0u8; rows * row_bytes];
+        for block in w.chunks_exact_mut(Q8_0_BLOCK_BYTES) {
+            block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // scale = 1.0
+            for (j, q) in block[2..].iter_mut().enumerate() {
+                *q = ((j as i32 * 23 - 50) % 127) as u8;
+            }
+        }
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.25).cos()).collect();
+
+        let mut y = vec![0f32; rows];
+        matvec_q8_0(&w, rows, cols, &x, &mut y).unwrap();
+
+        for r in 0..rows {
+            let expected = dot_q8_0_row(&w[r * row_bytes..(r + 1) * row_bytes], &x, Kernel::Scalar);
             assert!(
                 (y[r] - expected).abs() < 1e-3,
                 "row {r}: got {}, expected {expected}",
