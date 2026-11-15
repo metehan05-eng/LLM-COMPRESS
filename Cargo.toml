@@ -1,0 +1,27 @@
+[package]
+name = "llm-compress"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Compress and run LLMs on low-memory consumer hardware"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive", "env"] }
+rayon = "1.8"
+memmap2 = "0.9"
+anyhow = "1.0"
+dirs = "5.0"
+indicatif = "0.17"
+colored = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+comfy-table = "~7.1"
+sysinfo = "0.30"
+ureq = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
