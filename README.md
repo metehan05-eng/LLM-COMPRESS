@@ -2,9 +2,9 @@
 
 A command-line tool for compressing and running large language models on low-memory hardware, such as systems with 16 GB of RAM and integrated GPUs.
 
-`llm-compress` scans your machine for existing models (Ollama, the Hugging Face cache, and custom directories), requantizes GGUF files to smaller presets (Q4_K_M, Q3_K_M, IQ3_XXS, Q2_K), and launches them through `llama-cli` for CPU inference. It also ships native Q4_0 SIMD kernels and memory-mapping plumbing for an upcoming in-process inference path.
+`llm-compress` scans your machine for existing models (Ollama, the Hugging Face cache, and custom directories), requantizes GGUF files to smaller presets (Q4_K_M, Q3_K_M, IQ3_XXS, Q2_K), and launches them through `llama-cli` for CPU inference. It also ships native Q4_0 & Q8_0 SIMD kernels (AVX2/FMA and ARM NEON) and memory-mapping plumbing for an upcoming in-process inference path.
 
-> **Status: prototype.** Discovery, GGUF header parsing, the Q4_0 AVX2/FMA and scalar kernels, and the memory-mapping and thread-pool plumbing are implemented. Quantization and token generation are delegated to llama.cpp. A native transformer forward pass is not implemented yet.
+> **Status: prototype.** Discovery, GGUF header parsing, the Q4_0 & Q8_0 AVX2/FMA, ARM NEON, and scalar kernels, and the memory-mapping and thread-pool plumbing are implemented. Quantization and token generation are delegated to llama.cpp. A native transformer forward pass is not implemented yet.
 
 ## Features
 
@@ -16,10 +16,11 @@ A command-line tool for compressing and running large language models on low-mem
 - **Preset planning:** `estimate` shows the projected size of every preset and whether it fits in RAM; `--preset auto` picks the best one that does.
 - **Benchmarking:** `bench` wraps `llama-bench` and can compare several model files in one run.
 - **Quality check:** `perplexity` runs `llama-perplexity` and reports the PPL delta against a baseline model, such as the F16 original.
-- **Fast CPU kernels:** AVX2/FMA dot products for Q4_0 with a scalar fallback, parallelized with `rayon`.
+- **Fast CPU kernels:** AVX2/FMA (x86_64) and ARM NEON (aarch64 / Apple Silicon) dot products for Q4_0 and Q8_0 with a scalar fallback, parallelized with `rayon`.
 - **Memory mapping:** models are mapped with `memmap2`, so pages load on demand.
-- **System report:** shows CPU model, SIMD support, RAM, and free disk space.
-- **Scripting:** `--json` produces machine-readable output for `scan`, `info`, `estimate`, `perplexity`, `pull`, and `status`.
+- **Environment diagnostics:** `doctor` audits your hardware, SIMD instructions, RAM, disk, and checks whether external `llama.cpp` tools are installed.
+- **System report:** `status` shows CPU model, SIMD support, RAM, and free disk space.
+- **Scripting:** `--json` produces machine-readable output for `scan`, `info`, `estimate`, `perplexity`, `pull`, `status`, and `doctor`.
 
 ## How it works
 
@@ -61,6 +62,9 @@ llm-compress run --model ./llama3-8b-Q2_K.gguf --threads 8
 
 # 8. Check the hardware if you are unsure
 llm-compress status
+
+# 9. Verify your system and llama.cpp dependencies
+llm-compress doctor
 ```
 
 Everything runs locally. The only network access is the optional `pull` command, which downloads from the Hugging Face Hub.
