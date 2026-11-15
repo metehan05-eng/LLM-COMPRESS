@@ -16,11 +16,12 @@ A command-line tool for compressing and running large language models on low-mem
 - **Preset planning:** `estimate` shows the projected size of every preset and whether it fits in RAM; `--preset auto` picks the best one that does.
 - **Benchmarking:** `bench` wraps `llama-bench` and can compare several model files in one run.
 - **Quality check:** `perplexity` runs `llama-perplexity` and reports the PPL delta against a baseline model, such as the F16 original.
-- **Fast CPU kernels:** AVX2/FMA (x86_64) and ARM NEON (aarch64 / Apple Silicon) dot products for Q4_0 and Q8_0 with a scalar fallback, parallelized with `rayon`.
+- **Fast CPU kernels & Transformer Primitives:** AVX2/FMA (x86_64) and ARM NEON (aarch64 / Apple Silicon) dot products for Q4_0 and Q8_0, plus native RMSNorm, RoPE, Softmax, and SwiGLU building blocks parallelized with `rayon`.
+- **Embedded Tokenizer:** `tokenize` reads vocabulary metadata directly from the GGUF header to encode text or decode token IDs without needing external tools.
 - **Memory mapping:** models are mapped with `memmap2`, so pages load on demand.
 - **Environment diagnostics:** `doctor` audits your hardware, SIMD instructions, RAM, disk, and checks whether external `llama.cpp` tools are installed.
 - **System report:** `status` shows CPU model, SIMD support, RAM, and free disk space.
-- **Scripting:** `--json` produces machine-readable output for `scan`, `info`, `estimate`, `perplexity`, `pull`, `status`, and `doctor`.
+- **Scripting:** `--json` produces machine-readable output for `scan`, `info`, `estimate`, `perplexity`, `pull`, `status`, `doctor`, and `tokenize`.
 
 ## How it works
 
@@ -60,10 +61,13 @@ llm-compress perplexity --model ./llama3-8b-Q2_K.gguf --baseline ./llama3-8b-f16
 # 7. Run the smaller file
 llm-compress run --model ./llama3-8b-Q2_K.gguf --threads 8
 
-# 8. Check the hardware if you are unsure
+# 8. Inspect tokenizer and encode text directly
+llm-compress tokenize --model ./llama3-8b-Q2_K.gguf --text "Hello world"
+
+# 9. Check the hardware if you are unsure
 llm-compress status
 
-# 9. Verify your system and llama.cpp dependencies
+# 10. Verify your system and llama.cpp dependencies
 llm-compress doctor
 ```
 
