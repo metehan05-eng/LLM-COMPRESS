@@ -73,6 +73,7 @@ fn real_main() -> Result<()> {
         } => cmd_pull(&repo, &file, out, name, revision, token, force, json),
         Command::Run { model, threads } => cmd_run(&model, threads),
         Command::Status { json } => cmd_status(json),
+        Command::Doctor { json } => cmd_doctor(json),
     }
 }
 
@@ -819,6 +820,164 @@ fn cmd_status(json: bool) -> Result<()> {
         Some(bytes) => println!("  Disk free     : {} (home volume)", format_bytes(bytes)),
         None => println!("  Disk free     : unavailable"),
     }
+    Ok(())
+}
+
+fn cmd_doctor(json: bool) -> Result<()> {
+    let sys = System::new_all();
+    let logical = engine::default_threads();
+    let cpu = sys
+        .cpus()
+        .first()
+        .map(|c| c.brand().trim().to_string())
+        .filter(|s| !s.is_empty());
+    let total_ram = sys.total_memory();
+    let available_ram = sys.available_memory();
+    let simd = simd_summary();
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    let disk = disk_available(&home);
+
+    let tools = [
+        (
+            "llama-quantize",
+            "LLM_COMPRESS_QUANTIZE_BIN",
+            "Model compression (requantization)",
+        ),
+        (
+            "llama-imatrix",
+            "LLM_COMPRESS_IMATRIX_BIN",
+            "Importance matrix calibration",
+        ),
+        (
+            "llama-cli",
+            "LLM_COMPRESS_CLI_BIN",
+            "Interactive chat & token generation",
+        ),
+        (
+            "llama-bench",
+            "LLM_COMPRESS_BENCH_BIN",
+            "Hardware & model throughput benchmarking",
+        ),
+        (
+            "llama-perplexity",
+            "LLM_COMPRESS_PPL_BIN",
+            "Perplexity & quantization quality testing",
+        ),
+    ];
+
+    let mut tool_results = Vec::new();
+    let mut all_tools_ready = true;
+
+    for (bin, env_var, desc) in &tools {
+        match quantizer::find_tool(bin, env_var) {
+            Ok(path) => {
+                tool_results.push((bin, env_var, desc, Some(path), None));
+            }
+            Err(e) => {
+                all_tools_ready = false;
+                tool_results.push((bin, env_var, desc, None, Some(e.to_string())));
+            }
+        }
+    }
+
+    if json {
+        let tools_json: Vec<_> = tool_results
+            .iter()
+            .map(|(bin, env_var, desc, path, err)| {
+                json!({
+                    "name": bin,
+                    "env_var": env_var,
+                    "purpose": desc,
+                    "available": path.is_some(),
+                    "path": path.as_ref().map(|p| p.display().to_string()),
+                    "error": err,
+                })
+            })
+            .collect();
+
+        let out = json!({
+            "system": {
+                "arch": std::env::consts::ARCH,
+                "os": std::env::consts::OS,
+                "logical_cpus": logical,
+                "cpu_model": cpu,
+                "simd": simd,
+                "ram": { "total_bytes": total_ram, "available_bytes": available_ram },
+                "disk": { "path": home.display().to_string(), "available_bytes": disk },
+            },
+            "llama_cpp_tools": tools_json,
+            "ready": all_tools_ready,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!("{}", "=== System Diagnostics (Doctor) ===".bold());
+    println!("  Arch          : {}", std::env::consts::ARCH);
+    println!("  OS            : {}", std::env::consts::OS);
+    println!("  Logical CPUs  : {logical}");
+    println!(
+        "  CPU model     : {}",
+        cpu.unwrap_or_else(|| "unknown".into())
+    );
+    println!("  SIMD          : {simd}");
+    println!(
+        "  RAM           : {} free / {} total",
+        format_bytes(available_ram),
+        format_bytes(total_ram)
+    );
+    match disk {
+        Some(bytes) => println!("  Disk free     : {} (home)", format_bytes(bytes)),
+        None => println!("  Disk free     : unavailable"),
+    }
+
+    println!("\n{}", "=== External Dependencies (llama.cpp) ===".bold());
+    let mut ready_count = 0;
+    for (bin, env_var, desc, path, _) in &tool_results {
+        match path {
+            Some(p) => {
+                ready_count += 1;
+                println!(
+                    "  {} {:<18} : {} ({})",
+                    "✓".green().bold(),
+                    bin,
+                    p.display().to_string().cyan(),
+                    desc
+                );
+            }
+            None => {
+                println!(
+                    "  {} {:<18} : {} (or set {}=/path/to/{bin}) - {}",
+                    "✗".red().bold(),
+                    bin,
+                    "missing from PATH".yellow(),
+                    env_var,
+                    desc
+                );
+            }
+        }
+    }
+
+    println!();
+    if ready_count == tool_results.len() {
+        println!(
+            "{}",
+            "All dependencies are satisfied! Your system is fully ready for compression and inference."
+                .green()
+                .bold()
+        );
+    } else {
+        println!(
+            "{} {}/{} tools found.",
+            "Notice:".yellow().bold(),
+            ready_count,
+            tool_results.len()
+        );
+        println!(
+            "To install missing llama.cpp tools:\n  - Ubuntu/Debian: sudo apt install llama.cpp (or build from source at https://github.com/ggerganov/llama.cpp)\n  - macOS: brew install llama.cpp\n  - Or build llama.cpp and add its build directory to your PATH, or set the LLM_COMPRESS_*_BIN environment variables."
+        );
+    }
+
     Ok(())
 }
 

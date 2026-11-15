@@ -189,6 +189,13 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Diagnose system environment, hardware capabilities, and llama.cpp dependencies.
+    Doctor {
+        /// Print machine-readable JSON instead of tables/text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Preset as written on the command line, including `auto`.
