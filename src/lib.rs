@@ -8,3 +8,4 @@ pub mod cli;
 pub mod detector;
 pub mod engine;
 pub mod quantizer;
+pub mod tokenizer;

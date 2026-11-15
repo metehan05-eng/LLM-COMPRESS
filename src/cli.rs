@@ -196,6 +196,29 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Encode text to token IDs or decode token IDs using the GGUF embedded tokenizer.
+    Tokenize {
+        /// Model file path, or a name as shown by `scan`.
+        #[arg(long, value_name = "PATH_OR_NAME")]
+        model: String,
+
+        /// Text to encode into token IDs.
+        #[arg(long, value_name = "TEXT")]
+        text: Option<String>,
+
+        /// Comma-separated token IDs to decode back into text.
+        #[arg(long, value_name = "ID,...")]
+        ids: Option<String>,
+
+        /// Show vocabulary metadata (size, model type, special tokens).
+        #[arg(long)]
+        vocab_info: bool,
+
+        /// Print machine-readable JSON instead of tables/text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Preset as written on the command line, including `auto`.

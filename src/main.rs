@@ -9,7 +9,7 @@ use clap::Parser;
 use colored::Colorize;
 use comfy_table::{presets::UTF8_FULL, Table};
 use indicatif::{ProgressBar, ProgressStyle};
-use llm_compress::{cli, detector, engine, quantizer};
+use llm_compress::{cli, detector, engine, quantizer, tokenizer};
 use serde_json::json;
 use sysinfo::{Disks, System};
 
@@ -74,6 +74,13 @@ fn real_main() -> Result<()> {
         Command::Run { model, threads } => cmd_run(&model, threads),
         Command::Status { json } => cmd_status(json),
         Command::Doctor { json } => cmd_doctor(json),
+        Command::Tokenize {
+            model,
+            text,
+            ids,
+            vocab_info,
+            json,
+        } => cmd_tokenize(&model, text.as_deref(), ids.as_deref(), vocab_info, json),
     }
 }
 
@@ -1130,6 +1137,90 @@ fn available_ram() -> Option<u64> {
     let mut sys = System::new();
     sys.refresh_memory();
     Some(sys.available_memory()).filter(|bytes| *bytes > 0)
+}
+
+fn cmd_tokenize(
+    model: &str,
+    text: Option<&str>,
+    ids_str: Option<&str>,
+    vocab_info: bool,
+    json: bool,
+) -> Result<()> {
+    let path = resolve_model(model)?;
+    let tok = tokenizer::GgufTokenizer::from_file(&path)?;
+
+    if vocab_info || (text.is_none() && ids_str.is_none()) {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "model": tok.model,
+                    "vocab_size": tok.vocab_size,
+                    "bos_token_id": tok.bos_token_id,
+                    "eos_token_id": tok.eos_token_id,
+                    "unk_token_id": tok.unk_token_id,
+                }))?
+            );
+            return Ok(());
+        }
+        println!("{}", "=== Model Tokenizer Vocabulary ===".bold());
+        println!("  Tokenizer Model : {}", tok.model);
+        println!("  Vocab Size      : {}", tok.vocab_size);
+        println!("  BOS Token ID    : {:?}", tok.bos_token_id);
+        println!("  EOS Token ID    : {:?}", tok.eos_token_id);
+        println!("  UNK Token ID    : {:?}", tok.unk_token_id);
+        if text.is_none() && ids_str.is_none() {
+            println!("\nPass --text \"...\" to encode text or --ids \"...\" to decode token IDs.");
+            return Ok(());
+        }
+    }
+
+    if let Some(t) = text {
+        let tokens = tok.encode(t);
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "input_text": t,
+                    "token_count": tokens.len(),
+                    "token_ids": tokens,
+                }))?
+            );
+            return Ok(());
+        }
+        println!("\n{}", "=== Encoded Tokens ===".bold());
+        println!("  Input text  : \"{t}\"");
+        println!("  Token count : {}", tokens.len());
+        println!("  Token IDs   : {:?}", tokens);
+    }
+
+    if let Some(s) = ids_str {
+        let parsed_ids: Result<Vec<u32>> = s
+            .split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<u32>()
+                    .with_context(|| format!("invalid token ID '{part}'"))
+            })
+            .collect();
+        let parsed_ids = parsed_ids?;
+        let decoded = tok.decode(&parsed_ids);
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "token_ids": parsed_ids,
+                    "decoded_text": decoded,
+                }))?
+            );
+            return Ok(());
+        }
+        println!("\n{}", "=== Decoded Text ===".bold());
+        println!("  Token IDs    : {:?}", parsed_ids);
+        println!("  Decoded text : \"{decoded}\"");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

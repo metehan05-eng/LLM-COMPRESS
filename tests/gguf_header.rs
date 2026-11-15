@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use llm_compress::detector::{ggml_type_name, read_gguf_meta, tensor_size_bytes, GGUF_MAGIC};
+use llm_compress::tokenizer::GgufTokenizer;
 
 fn push_string(buf: &mut Vec<u8>, value: &str) {
     buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
@@ -94,4 +95,56 @@ fn rejects_non_gguf_files() {
     fs::remove_file(&path).ok();
 
     assert!(result.is_err());
+}
+
+#[test]
+fn parses_tokenizer_from_gguf_file() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(GGUF_MAGIC);
+    push_u32(&mut buf, 3);
+    push_u64(&mut buf, 0); // tensor count
+    push_u64(&mut buf, 5); // metadata count
+
+    push_string(&mut buf, "tokenizer.ggml.model");
+    push_u32(&mut buf, 8); // STRING
+    push_string(&mut buf, "llama");
+
+    push_string(&mut buf, "tokenizer.ggml.bos_token_id");
+    push_u32(&mut buf, 4); // UINT32
+    push_u32(&mut buf, 1);
+
+    push_string(&mut buf, "tokenizer.ggml.eos_token_id");
+    push_u32(&mut buf, 4); // UINT32
+    push_u32(&mut buf, 2);
+
+    push_string(&mut buf, "tokenizer.ggml.unknown_token_id");
+    push_u32(&mut buf, 4); // UINT32
+    push_u32(&mut buf, 0);
+
+    push_string(&mut buf, "tokenizer.ggml.tokens");
+    push_u32(&mut buf, 9); // ARRAY
+    push_u32(&mut buf, 8); // element type STRING
+    push_u64(&mut buf, 5); // count
+    push_string(&mut buf, "<unk>");
+    push_string(&mut buf, "<s>");
+    push_string(&mut buf, "</s>");
+    push_string(&mut buf, "\u{2581}hello");
+    push_string(&mut buf, "\u{2581}world");
+
+    let path = temp_path("tokenizer");
+    fs::write(&path, buf).unwrap();
+    let tok = GgufTokenizer::from_file(&path).unwrap();
+    fs::remove_file(&path).ok();
+
+    assert_eq!(tok.model, "llama");
+    assert_eq!(tok.vocab_size, 5);
+    assert_eq!(tok.bos_token_id, Some(1));
+    assert_eq!(tok.eos_token_id, Some(2));
+    assert_eq!(tok.unk_token_id, Some(0));
+
+    let encoded = tok.encode("hello world");
+    assert_eq!(encoded, vec![1, 3, 4]);
+
+    let decoded = tok.decode(&encoded);
+    assert_eq!(decoded.trim(), "hello world");
 }
