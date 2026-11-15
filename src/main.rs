@@ -81,6 +81,7 @@ fn real_main() -> Result<()> {
             vocab_info,
             json,
         } => cmd_tokenize(&model, text.as_deref(), ids.as_deref(), vocab_info, json),
+        Command::Clean { paths, yes, json } => cmd_clean(&paths, yes, json),
     }
 }
 
@@ -1218,6 +1219,121 @@ fn cmd_tokenize(
         println!("\n{}", "=== Decoded Text ===".bold());
         println!("  Token IDs    : {:?}", parsed_ids);
         println!("  Decoded text : \"{decoded}\"");
+    }
+
+    Ok(())
+}
+
+fn cmd_clean(paths: &[PathBuf], yes: bool, json: bool) -> Result<()> {
+    let candidates = detector::find_cleanable_files(paths)?;
+    let total_reclaimable: u64 = candidates.iter().map(|c| c.size_bytes).sum();
+
+    if json {
+        let items: Vec<_> = candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "path": c.path.display().to_string(),
+                    "size_bytes": c.size_bytes,
+                    "reason": c.reason,
+                })
+            })
+            .collect();
+
+        if yes {
+            let mut deleted_count = 0usize;
+            let mut deleted_bytes = 0u64;
+            for c in &candidates {
+                if fs::remove_file(&c.path).is_ok() {
+                    deleted_count += 1;
+                    deleted_bytes += c.size_bytes;
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "mode": "deleted",
+                    "deleted_count": deleted_count,
+                    "reclaimed_bytes": deleted_bytes,
+                    "files": items,
+                }))?
+            );
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "mode": "dry-run",
+                    "cleanable_count": candidates.len(),
+                    "reclaimable_bytes": total_reclaimable,
+                    "files": items,
+                }))?
+            );
+        }
+        return Ok(());
+    }
+
+    if candidates.is_empty() {
+        println!(
+            "{}",
+            "No temporary or incomplete files found. Disk is clean!"
+                .green()
+                .bold()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        "=== Cleanable Temporary / Incomplete Files ===".bold()
+    );
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_header(vec!["File", "Size", "Reason"]);
+
+    for c in &candidates {
+        table.add_row(vec![
+            c.path.display().to_string(),
+            format_bytes(c.size_bytes),
+            c.reason.to_string(),
+        ]);
+    }
+    println!("{table}");
+    println!(
+        "\nTotal disk space that can be reclaimed: {}",
+        format_bytes(total_reclaimable).bold().cyan()
+    );
+
+    if yes {
+        let mut deleted_count = 0usize;
+        let mut deleted_bytes = 0u64;
+        for c in &candidates {
+            match fs::remove_file(&c.path) {
+                Ok(_) => {
+                    deleted_count += 1;
+                    deleted_bytes += c.size_bytes;
+                }
+                Err(e) => {
+                    eprintln!("failed to remove {}: {e}", c.path.display());
+                }
+            }
+        }
+        println!(
+            "\n{}",
+            format!(
+                "Successfully deleted {} file(s) and reclaimed {}!",
+                deleted_count,
+                format_bytes(deleted_bytes)
+            )
+            .green()
+            .bold()
+        );
+    } else {
+        println!(
+            "\n{} This was a dry run. To permanently delete these files, run:\n  {}",
+            "Notice:".yellow().bold(),
+            "llm-compress clean --yes".cyan().bold()
+        );
     }
 
     Ok(())

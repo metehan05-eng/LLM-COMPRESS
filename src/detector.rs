@@ -379,6 +379,65 @@ fn collect_files(dir: &Path, max_depth: usize) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanCandidate {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub reason: &'static str,
+}
+
+/// Scan for incomplete downloads and orphaned temporary files.
+pub fn find_cleanable_files(extra_paths: &[PathBuf]) -> Result<Vec<CleanCandidate>> {
+    let mut candidates = Vec::new();
+    let mut search_dirs = Vec::new();
+
+    search_dirs.push(PathBuf::from("."));
+    search_dirs.extend_from_slice(extra_paths);
+
+    if let Some(home) = dirs::home_dir() {
+        let hf_hub = home.join(".cache").join("huggingface").join("hub");
+        if hf_hub.is_dir() {
+            search_dirs.push(hf_hub);
+        }
+    }
+
+    for dir in search_dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        for file in collect_files(&dir, 4)? {
+            let file_name = file
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+
+            let reason = if file_name.ends_with(".part") {
+                Some("Incomplete download (.part)")
+            } else if file_name.ends_with(".tmp") || file_name.ends_with(".temp") {
+                Some("Temporary file (.tmp)")
+            } else if file_name.ends_with(".imatrix.dat.tmp") {
+                Some("Incomplete importance matrix (.tmp)")
+            } else {
+                None
+            };
+
+            if let Some(reason) = reason {
+                if let Ok(md) = fs::metadata(&file) {
+                    candidates.push(CleanCandidate {
+                        path: file,
+                        size_bytes: md.len(),
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+
+    candidates.sort_by_key(|a| std::cmp::Reverse(a.size_bytes));
+    candidates.dedup_by(|a, b| a.path == b.path);
+    Ok(candidates)
+}
+
 /// Returns true if the file begins with the GGUF magic bytes.
 pub fn is_gguf(path: &Path) -> Result<bool> {
     let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -769,5 +828,29 @@ mod tests {
         assert_eq!(meta.param_count, 10);
         assert_eq!(meta.tensor_count, 2);
         assert_eq!(meta.split_no, Some(0));
+    }
+
+    #[test]
+    fn find_cleanable_files_detects_part_files() {
+        let temp_dir = std::env::temp_dir().join(format!("clean-test-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let part_file = temp_dir.join("model.gguf.part");
+        fs::write(&part_file, vec![0u8; 1024]).unwrap();
+
+        let normal_file = temp_dir.join("model.gguf");
+        fs::write(&normal_file, vec![0u8; 2048]).unwrap();
+
+        let candidates = find_cleanable_files(std::slice::from_ref(&temp_dir)).unwrap();
+        let found = candidates.iter().any(|c| c.path == part_file);
+        assert!(found, "should detect .part file as cleanable candidate");
+
+        let found_normal = candidates.iter().any(|c| c.path == normal_file);
+        assert!(
+            !found_normal,
+            "should NOT mark completed .gguf file as cleanable"
+        );
+
+        fs::remove_dir_all(&temp_dir).ok();
     }
 }

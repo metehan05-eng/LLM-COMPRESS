@@ -19,9 +19,10 @@ A command-line tool for compressing and running large language models on low-mem
 - **Fast CPU kernels & Transformer Primitives:** AVX2/FMA (x86_64) and ARM NEON (aarch64 / Apple Silicon) dot products for Q4_0 and Q8_0, plus native RMSNorm, RoPE, Softmax, and SwiGLU building blocks parallelized with `rayon`.
 - **Embedded Tokenizer:** `tokenize` reads vocabulary metadata directly from the GGUF header to encode text or decode token IDs without needing external tools.
 - **Memory mapping:** models are mapped with `memmap2`, so pages load on demand.
+- **Disk management:** `clean` scans for and safely removes interrupted downloads (`.part` files) and temporary files to reclaim disk space.
 - **Environment diagnostics:** `doctor` audits your hardware, SIMD instructions, RAM, disk, and checks whether external `llama.cpp` tools are installed.
 - **System report:** `status` shows CPU model, SIMD support, RAM, and free disk space.
-- **Scripting:** `--json` produces machine-readable output for `scan`, `info`, `estimate`, `perplexity`, `pull`, `status`, `doctor`, and `tokenize`.
+- **Scripting:** `--json` produces machine-readable output for `scan`, `info`, `estimate`, `perplexity`, `pull`, `status`, `doctor`, `tokenize`, and `clean`.
 
 ## How it works
 
@@ -69,6 +70,9 @@ llm-compress status
 
 # 10. Verify your system and llama.cpp dependencies
 llm-compress doctor
+
+# 11. Clean interrupted downloads and reclaim disk space
+llm-compress clean --yes
 ```
 
 Everything runs locally. The only network access is the optional `pull` command, which downloads from the Hugging Face Hub.

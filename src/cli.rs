@@ -219,6 +219,26 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Scan for and remove incomplete downloads (.part files) and orphaned temporary files.
+    Clean {
+        /// Target directories to inspect. Defaults to current directory and scan paths.
+        #[arg(
+            long = "path",
+            value_name = "DIR",
+            env = "LLM_COMPRESS_PATHS",
+            value_delimiter = ':'
+        )]
+        paths: Vec<PathBuf>,
+
+        /// Actually delete files (default is dry-run which only reports space to reclaim).
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Print machine-readable JSON instead of tables/text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Preset as written on the command line, including `auto`.
