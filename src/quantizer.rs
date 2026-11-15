@@ -89,6 +89,20 @@ pub fn compress(
             input.display()
         );
     }
+    if let Ok(meta) = crate::detector::read_gguf_meta(input) {
+        if let Some(ft) = meta.file_type {
+            // llama.cpp only allows quantizing from F32 (0), F16 (1), BF16 (28), or Q8_0 (7)
+            if ft != 0 && ft != 1 && ft != 28 && ft != 7 {
+                let current_quant = meta.quant_name();
+                bail!(
+                    "cannot requantize already-quantized model '{}' ({current_quant}).\n\
+                     llama.cpp requires an unquantized source model (F16, BF16, or Q8_0) for quantization \
+                     because re-quantizing an already lossy format (like {current_quant}) severely degrades quality.",
+                    input.display()
+                );
+            }
+        }
+    }
     if preset == Preset::Iq3Xxs && imatrix.is_none() {
         bail!(
             "{} requires an importance matrix. Pass --calibration <text> or --imatrix <file>",
@@ -146,6 +160,7 @@ pub fn compress(
     bar.finish_and_clear();
 
     if !status.success() {
+        let _ = fs::remove_file(output);
         bail!(
             "llama-quantize failed with {status}. Last output:\n{}",
             tail.into_iter().collect::<Vec<_>>().join("\n")
