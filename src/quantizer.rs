@@ -22,14 +22,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 use crate::cli::Preset;
 use crate::detector::is_gguf;
 
-/// Locate an external tool: explicit env override first, then `PATH`.
+/// Locate an external tool: explicit env override first (if valid), then `PATH`.
 pub fn find_tool(bin: &str, env_var: &str) -> Result<PathBuf> {
     if let Ok(explicit) = std::env::var(env_var) {
         let p = PathBuf::from(&explicit);
         if p.is_file() {
             return Ok(p);
         }
-        bail!("{env_var} is set to {explicit}, but that file does not exist");
     }
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path_var) {
