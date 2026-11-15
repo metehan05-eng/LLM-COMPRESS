@@ -157,6 +157,10 @@ fn cmd_info(model: &str, json: bool) -> Result<()> {
             "quant": meta.quant_name(),
             "tensor_count": meta.tensor_count,
             "param_count": meta.param_count,
+            "context_length": meta.context_length(),
+            "block_count": meta.block_count(),
+            "embedding_length": meta.embedding_length(),
+            "head_count": meta.head_count(),
             "split_count": meta.split_count,
             "split_no": meta.split_no,
             "tensors": tensors,
@@ -177,6 +181,18 @@ fn cmd_info(model: &str, json: bool) -> Result<()> {
     println!("  Quantization : {}", meta.quant_name());
     println!("  Tensors      : {}", meta.tensor_count);
     println!("  Parameters   : {}", format_params(meta.param_count));
+    if let Some(ctx) = meta.context_length() {
+        println!("  Context      : {ctx} tokens");
+    }
+    if let Some(blocks) = meta.block_count() {
+        println!("  Layers       : {blocks}");
+    }
+    if let Some(emb) = meta.embedding_length() {
+        println!("  Embedding dim: {emb}");
+    }
+    if let Some(heads) = meta.head_count() {
+        println!("  Attn heads   : {heads}");
+    }
     if let Some(total) = meta.split_count.filter(|n| *n > 1) {
         println!(
             "  Split        : {}/{}",

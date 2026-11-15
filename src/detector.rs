@@ -103,6 +103,34 @@ impl GgufMeta {
             None => "unknown".to_string(),
         }
     }
+
+    pub fn context_length(&self) -> Option<u64> {
+        let arch = self.architecture.as_deref().unwrap_or("llama");
+        self.ints
+            .get(&format!("{arch}.context_length"))
+            .map(|v| *v as u64)
+    }
+
+    pub fn block_count(&self) -> Option<u64> {
+        let arch = self.architecture.as_deref().unwrap_or("llama");
+        self.ints
+            .get(&format!("{arch}.block_count"))
+            .map(|v| *v as u64)
+    }
+
+    pub fn embedding_length(&self) -> Option<u64> {
+        let arch = self.architecture.as_deref().unwrap_or("llama");
+        self.ints
+            .get(&format!("{arch}.embedding_length"))
+            .map(|v| *v as u64)
+    }
+
+    pub fn head_count(&self) -> Option<u64> {
+        let arch = self.architecture.as_deref().unwrap_or("llama");
+        self.ints
+            .get(&format!("{arch}.attention.head_count"))
+            .map(|v| *v as u64)
+    }
 }
 
 #[derive(Debug, Clone)]
