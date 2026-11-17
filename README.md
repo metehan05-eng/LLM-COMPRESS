@@ -1,293 +1,222 @@
 # llm-compress
 
-A command-line tool for compressing and running large language models on low-memory hardware, such as systems with 16 GB of RAM and integrated GPUs.
+`llm-compress` is a Rust command-line utility for discovering, inspecting, downloading, compressing, and running GGUF language models on local hardware. It wraps llama.cpp for quantization, benchmarking, perplexity evaluation, and in-process inference.
 
-`llm-compress` scans your machine for existing models (Ollama, the Hugging Face cache, and custom directories), requantizes GGUF files to smaller presets (Q4_K_M, Q3_K_M, IQ3_XXS, Q2_K), and launches them through `llama-cli` for CPU inference. It also ships native Q4_0 & Q8_0 SIMD kernels (AVX2/FMA and ARM NEON) and memory-mapping plumbing for an upcoming in-process inference path.
-
-> **Status: prototype.** Discovery, GGUF header parsing, the Q4_0 & Q8_0 AVX2/FMA, ARM NEON, and scalar kernels, and the memory-mapping and thread-pool plumbing are implemented. Quantization and token generation are delegated to llama.cpp. A native transformer forward pass is not implemented yet.
+The `run` command calls the llama.cpp C API in the same process. llama.cpp handles model loading, GGUF architecture support, tokenization, chat templates, and transformer execution. Rust also includes Q4_0/Q8_0 SIMD kernels and Transformer math primitives; these kernels are not currently part of the `run` inference path.
 
 ## Features
 
-- **Model discovery:** finds models in `~/.ollama/models`, `~/.cache/huggingface/hub`, and any directories you specify. Ollama digests are resolved to their GGUF blobs, and split GGUF shards are merged into one entry.
-- **Header inspection:** reads GGUF metadata (architecture, parameter count, quantization type) without loading tensor data.
-- **Tensor detail:** the `info` command lists every tensor with its dimensions, ggml type, element count, and approximate size.
-- **Compression:** wraps `llama-quantize` with progress reporting, and supports importance matrices (imatrix) for better low-bit quality.
-- **Remote download:** `pull` fetches a GGUF from the Hugging Face Hub with a progress bar, free-space check, optional token for gated repositories, and an atomic `.part` file.
-- **Preset planning:** `estimate` shows the projected size of every preset and whether it fits in RAM; `--preset auto` picks the best one that does.
-- **Benchmarking:** `bench` wraps `llama-bench` and can compare several model files in one run.
-- **Quality check:** `perplexity` runs `llama-perplexity` and reports the PPL delta against a baseline model, such as the F16 original.
-- **Fast CPU kernels & Transformer Primitives:** AVX2/FMA (x86_64) and ARM NEON (aarch64 / Apple Silicon) dot products for Q4_0 and Q8_0, plus native RMSNorm, RoPE, Softmax, and SwiGLU building blocks parallelized with `rayon`.
-- **Embedded Tokenizer:** `tokenize` reads vocabulary metadata directly from the GGUF header to encode text or decode token IDs without needing external tools.
-- **Memory mapping:** models are mapped with `memmap2`, so pages load on demand.
-- **Disk management:** `clean` scans for and safely removes interrupted downloads (`.part` files) and temporary files to reclaim disk space.
-- **Environment diagnostics:** `doctor` audits your hardware, SIMD instructions, RAM, disk, and checks whether external `llama.cpp` tools are installed.
-- **System report:** `status` shows CPU model, SIMD support, RAM, and free disk space.
-- **Scripting:** `--json` produces machine-readable output for `scan`, `info`, `estimate`, `perplexity`, `pull`, `status`, `doctor`, `tokenize`, and `clean`.
-
-## How it works
-
-`llm-compress` is a thin orchestration layer around llama.cpp. It does not re-implement the quantizers or the transformer; it locates models, validates them, and invokes the reference tools with the right arguments.
-
-1. **Download (`pull`).** Resolves `https://huggingface.co/<repo>/resolve/<revision>/<file>`, follows redirects to the CDN, streams the body to `<output>.part`, and renames it into place only after the GGUF magic validates. A `Content-Length` header drives the progress bar and a free-space check; `HF_TOKEN` supplies auth for gated repositories, and `HF_ENDPOINT` selects a mirror.
-2. **Discovery (`scan`).** Walks `~/.ollama/models`, `~/.cache/huggingface/hub`, and any `--path` directories. For Ollama, each manifest is read and the `application/vnd.ollama.image.model` layer is resolved to its blob. For every GGUF only the header is parsed (magic, version, metadata, tensor descriptors) to report architecture, parameter count, and quantization; tensor data is never loaded. Shards of a split model are grouped via `split.count`/`split.no`.
-3. **Inspection (`info`).** Prints the full GGUF metadata, split status, and a tensor table (name, dimensions, ggml type, elements, approximate size). `--json` is available for tooling.
-4. **Planning (`estimate`).** Estimates the output size of every preset from the parameter count and bits per weight, shows the ratio against the current file, and marks which presets fit in free RAM.
-5. **Compression (`compress`).** Resolves the model name or path, validates inputs, optionally builds an importance matrix with `llama-imatrix` from a calibration text, then runs `llama-quantize <input> <output> <type> <threads>` (prefixed with `--imatrix` when available). With `--preset auto` it picks the highest-quality preset that fits in RAM. Progress is parsed from the tool's `[ n/total ]` output.
-6. **Benchmarking (`bench`).** Resolves one or more models and runs `llama-bench`, passing `-m`, `-t`, `-r`, and an optional `-o` format through.
-7. **Quality check (`perplexity`).** Runs `llama-perplexity -m <model> -f <text>` and parses the final `PPL =` line. With `--baseline` it runs a reference model too and reports the percentage change.
-8. **Run (`run`).** Opens and validates the GGUF header, then starts `llama-cli -m <model> -t <threads> -cnv`, so the full forward pass happens inside llama.cpp. The native Q4_0 kernels and `memmap2` mapping in `engine.rs` are the building blocks for moving inference in-process later.
-9. **Status (`status`).** Reports architecture, logical CPU count, AVX2/FMA/AVX-512 support, free RAM, and free disk space through `sysinfo`, so it works on Linux, macOS, and Windows.
-
-### Typical workflow
-
-```bash
-# 1. (Optional) Download a GGUF from Hugging Face
-llm-compress pull --repo bartowski/Llama-3.2-1B-Instruct-GGUF --file Llama-3.2-1B-Instruct-Q4_K_M.gguf --out ./models
-
-# 2. See what is installed
-llm-compress scan --path ./models
-
-# 3. Plan the size (and check RAM headroom)
-llm-compress estimate --model llama3:8b
-
-# 4. Shrink a model, letting the tool choose a preset that fits
-llm-compress compress --model llama3:8b --preset auto
-
-# 5. Compare throughput of the files you kept
-llm-compress bench --model ./llama3-8b-Q4_K_M.gguf --model ./llama3-8b-Q2_K.gguf
-
-# 6. Check quality loss against the original
-llm-compress perplexity --model ./llama3-8b-Q2_K.gguf --baseline ./llama3-8b-f16.gguf --file wiki.test.txt
-
-# 7. Run the smaller file
-llm-compress run --model ./llama3-8b-Q2_K.gguf --threads 8
-
-# 8. Inspect tokenizer and encode text directly
-llm-compress tokenize --model ./llama3-8b-Q2_K.gguf --text "Hello world"
-
-# 9. Check the hardware if you are unsure
-llm-compress status
-
-# 10. Verify your system and llama.cpp dependencies
-llm-compress doctor
-
-# 11. Clean interrupted downloads and reclaim disk space
-llm-compress clean --yes
-```
-
-Everything runs locally. The only network access is the optional `pull` command, which downloads from the Hugging Face Hub.
+- **Model discovery (`scan`):** Finds models in Ollama, the Hugging Face cache, and custom directories. Split GGUF shards are grouped into one model entry.
+- **GGUF inspection (`info`):** Displays metadata, architecture, parameter count, quantization type, and tensor details.
+- **Model downloads (`pull`):** Downloads GGUF files from Hugging Face into a temporary `.part` file, checks the GGUF signature, then moves the file into place. Supports gated repositories with a Hugging Face token. Downloads do not resume.
+- **Compression (`compress`):** Runs `llama-quantize` with `Q4_K_M`, `Q3_K_M`, `IQ3_XXS`, or `Q2_K`. The `auto` preset estimates a suitable size from available RAM. IQ3_XXS can use a precomputed importance matrix or generate one from a calibration corpus.
+- **Compression quality comparison:** `compress --quality-file` evaluates the source and quantized models on the same text corpus and reports the perplexity (PPL) change.
+- **Benchmarking (`bench`):** Runs `llama-bench` on one or more models.
+- **Perplexity (`perplexity`):** Runs `llama-perplexity` and can compare a model against a baseline.
+- **In-process chat (`run`):** Loads a GGUF model through the llama.cpp shared library and applies its chat template when available. Configure the context length and maximum reply length with `--context` and `--predict`.
+- **Tokenizer inspection (`tokenize`):** Reads vocabulary metadata and can decode token IDs. Its text-to-token encoding is a basic approximation and may not match the model's tokenizer implementation.
+- **System tools (`status`, `doctor`):** Reports hardware details and checks for external llama.cpp command-line tools.
+- **Cleanup (`clean`):** Finds interrupted downloads and temporary files. It lists candidates by default and deletes only when `--yes` is supplied.
+- **JSON output:** Available for `scan`, `info`, `estimate`, `perplexity`, `pull`, `status`, `doctor`, `tokenize`, and `clean`.
 
 ## Requirements
 
-- Rust 1.85 or newer
-- [llama.cpp](https://github.com/ggerganov/llama.cpp) binaries on your `PATH`: `llama-quantize`, `llama-imatrix`, `llama-cli`, `llama-bench`, and `llama-perplexity`
-- Linux is the primary target. Hardware reporting uses `sysinfo`, so macOS and Windows work too; the SIMD kernels are x86_64-only with a scalar fallback elsewhere.
+- Rust 1.85 or newer (`cargo` and `rustc`).
+- A compatible llama.cpp build with the `libllama` and `libggml` shared libraries. These are required at build and runtime for `run`.
+- llama.cpp command-line tools as needed:
+  - `llama-quantize` for compression.
+  - `llama-imatrix` for generating an importance matrix from calibration text.
+  - `llama-bench` for benchmarking.
+  - `llama-perplexity` for perplexity evaluation.
 
-## Installation
+The build script searches standard library locations for llama.cpp. If its libraries are installed elsewhere, set `LLM_COMPRESS_LLAMA_LIB_DIR` to the directory containing `libllama`. The GGML library must also be discoverable in that directory, a nearby standard location, or a system library directory. The llama.cpp tools can be placed on `PATH` or configured with the environment variables listed below.
+
+## Build
 
 ```bash
-git clone https://github.com/your-username/llm-compress.git
-cd llm-compress
 cargo build --release
 ```
 
-The binary is written to `target/release/llm-compress`.
+The executable is written to `target/release/llm-compress`. During development, use `cargo run -- <command>`.
 
-If the llama.cpp tools are not on your `PATH`, set their locations explicitly:
+## Quick start
 
 ```bash
-export LLM_COMPRESS_QUANTIZE_BIN=/path/to/llama-quantize
-export LLM_COMPRESS_IMATRIX_BIN=/path/to/llama-imatrix
-export LLM_COMPRESS_CLI_BIN=/path/to/llama-cli
-export LLM_COMPRESS_BENCH_BIN=/path/to/llama-bench
-export LLM_COMPRESS_PPL_BIN=/path/to/llama-perplexity
+# Check the system and external llama.cpp tools
+cargo run -- doctor
+
+# Download an F16 model from Hugging Face
+cargo run -- pull \
+  --repo bartowski/SmolLM2-135M-Instruct-GGUF \
+  --file SmolLM2-135M-Instruct-f16.gguf \
+  --out ./models
+
+# Inspect the downloaded model
+cargo run -- info --model ./models/SmolLM2-135M-Instruct-f16.gguf
+
+# Quantize it to Q4_K_M
+cargo run -- compress \
+  --model ./models/SmolLM2-135M-Instruct-f16.gguf \
+  --preset Q4_K_M \
+  --out ./models/SmolLM2-135M-Q4_K_M.gguf
+
+# Start an in-process chat session
+cargo run -- run \
+  --model ./models/SmolLM2-135M-Q4_K_M.gguf \
+  --threads 6 --context 2048 --predict 128
 ```
 
-## Usage
+Type `/exit` or `/quit` to leave the chat session.
+
+## Command reference
+
+### Discover and inspect models
+
+```bash
+cargo run -- scan --path ./models
+cargo run -- scan --path ./models --json
+cargo run -- info --model ./models/model.gguf
+cargo run -- estimate --model ./models/model.gguf
+cargo run -- status
+cargo run -- doctor --json
+```
+
+`scan` also searches `~/.ollama/models` and `~/.cache/huggingface/hub`. Supply `--path` more than once to include additional directories.
 
 ### Download a model
 
 ```bash
-# Public repository, into ./models
-llm-compress pull --repo bartowski/Llama-3.2-1B-Instruct-GGUF \
-  --file Llama-3.2-1B-Instruct-Q4_K_M.gguf --out ./models
-
-# Gated repository (reads HF_TOKEN when --token is omitted)
-export HF_TOKEN=hf_...
-llm-compress pull --repo meta-llama/Llama-3.2-1B-Instruct-GGUF \
-  --file Llama-3.2-1B-Instruct-Q4_K_M.gguf
-
-# Pin a revision and rename the result
-llm-compress pull --repo org/repo --file models/model.gguf \
-  --revision v1.0 --name model-q4.gguf --out ./models --json
-
-# Mirror (e.g. behind a firewall)
-export HF_ENDPOINT=https://hf-mirror.com
+cargo run -- pull \
+  --repo bartowski/Llama-3.2-1B-Instruct-GGUF \
+  --file Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+  --out ./models
 ```
 
-`--file` is the path inside the repository; the output name defaults to the last path segment. Downloads stream to `<name>.part` and are renamed only after the GGUF magic validates, so an interrupted run never leaves a half-written model under the final name. The free-space check uses `Content-Length`, and `--force` overwrites an existing file. For split GGUFs, pass each shard as a separate `--file`; `scan` groups them afterwards.
+For gated repositories, set `HF_TOKEN` or pass `--token`. To use a Hugging Face-compatible mirror, set `HF_ENDPOINT`.
 
-### Scan for models
+### Compress and evaluate quality
+
+Quantization accepts unquantized F16, BF16, or F32 GGUF input. `--preset auto` chooses from Q4_K_M, Q3_K_M, and Q2_K based on the estimated output size and available RAM. IQ3_XXS requires an importance matrix or calibration text.
 
 ```bash
-llm-compress scan
-llm-compress scan --path /data/gguf --path /mnt/models
-llm-compress scan --json
+# Standard Q4_K_M quantization
+cargo run -- compress \
+  --model ./models/model-f16.gguf \
+  --preset Q4_K_M \
+  --out ./models/model-Q4_K_M.gguf
+
+# Choose a preset automatically
+cargo run -- compress --model ./models/model-f16.gguf --preset auto
+
+# Build an importance matrix from calibration text for IQ3_XXS
+cargo run -- compress \
+  --model ./models/model-f16.gguf \
+  --preset IQ3_XXS \
+  --calibration ./calibration.txt
+
+# Compare source and quantized perplexity on the same corpus
+cargo run -- compress \
+  --model ./models/model-f16.gguf \
+  --preset Q4_K_M \
+  --quality-file ./evaluation.txt
 ```
 
-Extra directories can also be set with the `LLM_COMPRESS_PATHS` environment variable, separated by colons:
+Use `--imatrix FILE` to provide an existing importance matrix instead of generating one. Use `--force` to replace an existing output file. Compression stages the output and validates it before moving it to the final path; incomplete staged files are cleaned up on failure.
+
+### Benchmark and perplexity
 
 ```bash
-export LLM_COMPRESS_PATHS=/data/gguf:/mnt/models
+# Compare multiple models
+cargo run -- bench \
+  --model ./models/model-f16.gguf \
+  --model ./models/model-Q4_K_M.gguf
+
+# Select llama-bench output format
+cargo run -- bench --model ./models/model-Q4_K_M.gguf --output json
+
+# Compare perplexity against a baseline model
+cargo run -- perplexity \
+  --model ./models/model-Q4_K_M.gguf \
+  --baseline ./models/model-f16.gguf \
+  --file ./evaluation.txt
 ```
-
-### Inspect a model
-
-```bash
-llm-compress info --model llama3:8b
-llm-compress info --model ./model.gguf --json
-```
-
-`info` prints GGUF version, architecture, quantization, split status, and a table of every tensor with its dimensions, ggml type, element count, and approximate size.
-
-### Estimate output sizes
-
-```bash
-llm-compress estimate --model llama3:8b
-llm-compress estimate --model llama3:8b --json
-```
-
-`estimate` projects the size of each preset from the parameter count and its typical bits per weight, compares it with the current file, and marks whether it fits in free RAM (with a 15% headroom).
-
-### Compress a model
-
-```bash
-# Standard quantization
-llm-compress compress --model llama3:8b --preset Q4_K_M
-
-# Let the tool choose the best preset that fits in RAM (never IQ3_XXS)
-llm-compress compress --model llama3:8b --preset auto
-
-# Custom output path
-llm-compress compress --model ./model-f16.gguf --preset Q3_K_M --out ./small.gguf
-
-# Low-bit quantization with a calibration corpus
-llm-compress compress --model llama3:8b --preset IQ3_XXS --calibration calib.txt
-
-# Reuse a precomputed importance matrix
-llm-compress compress --model llama3:8b --preset Q2_K --imatrix model.imatrix
-
-# Overwrite an existing output file
-llm-compress compress --model llama3:8b --preset Q4_K_M --out small.gguf --force
-```
-
-| Option       | Description                                                                 |
-|--------------|-----------------------------------------------------------------------------|
-| `--model`    | File path, or a name shown by `scan` (e.g. `llama3:8b`)                     |
-| `--preset`   | `Q4_K_M` (default), `Q3_K_M`, `IQ3_XXS`, `Q2_K`, or `auto`                  |
-| `--out`      | Output file. Defaults to `<input>-<preset>.gguf` next to the input          |
-| `--imatrix`  | Precomputed importance matrix file. Conflicts with `--calibration`           |
-| `--calibration` | Plain-text corpus used to generate an importance matrix                  |
-| `--force`    | Overwrite the output file if it already exists                               |
-| `--threads`  | Worker threads. Defaults to the logical CPU count (`LLM_COMPRESS_THREADS`)  |
-
-Notes:
-- `IQ3_XXS` requires an importance matrix. The command fails early if you do not provide one with `--calibration` or `--imatrix`.
-- `--preset auto` picks the highest-quality preset whose estimated size fits in 85% of free RAM. It skips `IQ3_XXS` because that preset needs an importance matrix.
-- `compress` refuses to write over its input, missing calibration/imatrix files, and existing outputs without `--force`; it also checks free disk space against a preset size estimate before starting.
-- Size estimates are approximate and ignore header and metadata overhead.
-- Only GGUF input is accepted. Convert Hugging Face safetensors first with llama.cpp's `convert_hf_to_gguf.py`.
-
-### Benchmark models
-
-```bash
-llm-compress bench --model ./llama3-8b-Q4_K_M.gguf
-llm-compress bench --model ./llama3-8b-Q4_K_M.gguf --model ./llama3-8b-Q2_K.gguf --reps 5
-```
-
-`bench` resolves each `--model` and runs `llama-bench` with `-m`, `-t`, and `-r`. Pass `--output md|csv|json|sql` to forward llama-bench's own `-o` format.
-
-### Check quality
-
-```bash
-# Perplexity of one file
-llm-compress perplexity --model ./llama3-8b-Q2_K.gguf --file wiki.test.txt
-
-# Compare against the F16 original and print the delta
-llm-compress perplexity --model ./llama3-8b-Q2_K.gguf --baseline ./llama3-8b-f16.gguf --file wiki.test.txt
-
-# Machine-readable result
-llm-compress perplexity --model ./llama3-8b-Q2_K.gguf --baseline ./llama3-8b-f16.gguf --file wiki.test.txt --json
-```
-
-`perplexity` runs `llama-perplexity` (passing `-c` and `--chunks` through when set), parses the final `PPL =` line, and reports the percentage change versus `--baseline`. Lower is better; a large positive delta means the quantization hurt quality.
 
 ### Run a model
 
 ```bash
-llm-compress run --model llama3:8b --threads 8
+cargo run -- run \
+  --model ./models/model-Q4_K_M.gguf \
+  --threads 6 \
+  --context 2048 \
+  --predict 128
 ```
 
-This memory-maps the model, reports its metadata, and starts an interactive chat session through `llama-cli`.
+`--context` defaults to the model's training context, and `--predict` defaults to 128 new tokens per reply. The selected context affects memory use. llama.cpp loads the model's embedded chat template when available; models without a template use plain role-prefixed text.
 
-### System status
+### Inspect tokenizer data
 
 ```bash
-llm-compress status
-llm-compress status --json
+# Approximate text encoding
+cargo run -- tokenize --model ./models/model.gguf --text "Hello, world"
+
+# Decode token IDs
+cargo run -- tokenize --model ./models/model.gguf --ids "1, 15043, 29889"
+
+# Show vocabulary metadata
+cargo run -- tokenize --model ./models/model.gguf --vocab-info
 ```
+
+The built-in `tokenize --text` path uses a simple greedy vocabulary match with SentencePiece-style whitespace handling. It does not implement every tokenizer algorithm, including full BPE and byte fallback, and should not be used when exact token IDs are required. In-process chat uses llama.cpp's tokenizer instead.
+
+### Clean temporary files
+
+```bash
+# List cleanup candidates without deleting them
+cargo run -- clean --path ./models
+
+# Delete matching .part, .tmp, and .temp files
+cargo run -- clean --path ./models --yes
+```
+
+## Environment variables
+
+| Variable | Description |
+| --- | --- |
+| `LLM_COMPRESS_PATHS` | Additional model search and cleanup directories, separated by `:`. |
+| `LLM_COMPRESS_THREADS` | Default worker thread count for supported commands. |
+| `LLM_COMPRESS_LLAMA_LIB_DIR` | Directory containing the llama.cpp shared library used at build time. |
+| `LLM_COMPRESS_QUANTIZE_BIN` | Path to `llama-quantize`. |
+| `LLM_COMPRESS_IMATRIX_BIN` | Path to `llama-imatrix`. |
+| `LLM_COMPRESS_BENCH_BIN` | Path to `llama-bench`. |
+| `LLM_COMPRESS_PPL_BIN` | Path to `llama-perplexity`. |
+| `HF_TOKEN` | Hugging Face access token for gated repositories. |
+| `HF_ENDPOINT` | Optional Hugging Face-compatible endpoint or mirror. |
 
 ## Project structure
 
-```
+```text
 src/
-├── main.rs        # Entry point and command dispatch
-├── lib.rs         # Library surface (used by integration tests and embedders)
-├── cli.rs         # Command-line definitions (clap)
-├── detector.rs    # Model discovery and GGUF header parsing
-├── quantizer.rs   # Wrappers around llama-quantize and llama-imatrix
-└── engine.rs      # Memory mapping, Q4_0 kernels, thread pool, REPL
+├── main.rs          # Entry point and command dispatch
+├── cli.rs           # Command-line argument definitions
+├── detector.rs      # GGUF metadata parsing and model discovery
+├── quantizer.rs     # llama.cpp quantization tool wrapper
+├── llama_backend.rs # In-process llama.cpp C API bindings and chat loop
+├── engine.rs        # SIMD kernels and Transformer math primitives
+└── tokenizer.rs     # GGUF vocabulary inspection and basic token operations
 
-tests/
-└── gguf_header.rs # Integration test with a synthetic GGUF fixture
+build.rs             # Locate and link llama.cpp shared libraries
+tests/               # Integration tests
 ```
 
-## Testing
+## Development checks
 
 ```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
-
-The test suite covers AVX2 and scalar Q4_0 kernel agreement, f16 conversion, split GGUF suffix parsing and shard merging, tensor-size block layouts, `auto` preset selection, `PPL =` parsing, and an integration test that parses a synthetic GGUF header through the library API.
-
-## Configuration
-
-| Variable                       | Purpose                                        |
-|--------------------------------|------------------------------------------------|
-| `LLM_COMPRESS_PATHS`           | Colon-separated extra directories to scan      |
-| `LLM_COMPRESS_THREADS`         | Default worker thread count                    |
-| `LLM_COMPRESS_QUANTIZE_BIN`    | Path to `llama-quantize`                       |
-| `LLM_COMPRESS_IMATRIX_BIN`     | Path to `llama-imatrix`                        |
-| `LLM_COMPRESS_CLI_BIN`         | Path to `llama-cli`                            |
-| `LLM_COMPRESS_BENCH_BIN`       | Path to `llama-bench`                          |
-| `LLM_COMPRESS_PPL_BIN`         | Path to `llama-perplexity`                     |
-| `HF_TOKEN`                     | Hugging Face token for `pull` (gated repos)    |
-| `HF_ENDPOINT`                  | Hugging Face base URL for `pull` (mirror)      |
-
-## Limitations
-
-- **Inference is delegated.** `run` launches `llama-cli`, which performs the forward pass. The native kernels are not yet connected to a transformer implementation.
-- **Thread count.** `--threads` uses logical CPUs, which include SMT siblings. Memory-bound matrix-vector products often run faster with fewer threads, so benchmark on your hardware.
-- **Memory mapping.** Pages can be evicted under memory pressure, so models larger than free RAM still run, but may be slower because data is re-read from disk.
-- **Platform support.** Hardware reporting now uses `sysinfo` and works on Linux, macOS, and Windows. The SIMD kernels are x86_64-only, with a scalar fallback on other architectures.
-
-## Roadmap
-
-- Validate tensor data offsets against the file size and apply `general.alignment`
-- Connect the Q4_0 kernels to attention and feed-forward projections for native inference
-- Add K-quant kernels (Q4_K, Q3_K) with 256-weight superblocks
-- Physical core detection for thread defaults
 
 ## License
 
 MIT
+# LLM-COMPRESS
