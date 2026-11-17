@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use llm_compress::{cli, detector, engine, quantizer, tokenizer};
 use serde_json::json;
 use sysinfo::{Disks, System};
+
+mod llama_backend;
 
 use cli::{Cli, Command, Preset, PresetArg};
 
@@ -33,9 +36,19 @@ fn real_main() -> Result<()> {
             out,
             imatrix,
             calibration,
+            quality_file,
             threads,
             force,
-        } => cmd_compress(&model, preset, out, imatrix, calibration, threads, force),
+        } => cmd_compress(
+            &model,
+            preset,
+            out,
+            imatrix,
+            calibration,
+            quality_file,
+            threads,
+            force,
+        ),
         Command::Info { model, json } => cmd_info(&model, json),
         Command::Estimate { model, json } => cmd_estimate(&model, json),
         Command::Bench {
@@ -71,7 +84,12 @@ fn real_main() -> Result<()> {
             force,
             json,
         } => cmd_pull(&repo, &file, out, name, revision, token, force, json),
-        Command::Run { model, threads } => cmd_run(&model, threads),
+        Command::Run {
+            model,
+            threads,
+            context,
+            predict,
+        } => cmd_run(&model, threads, context, predict),
         Command::Status { json } => cmd_status(json),
         Command::Doctor { json } => cmd_doctor(json),
         Command::Tokenize {
@@ -453,10 +471,19 @@ fn run_ppl(
     });
 
     let mut ppl = None;
+    let mut tail = VecDeque::with_capacity(12);
     for (is_stderr, line) in rx {
         if let Some(value) = parse_ppl(&line) {
             ppl = Some(value);
         }
+        if tail.len() == 12 {
+            tail.pop_front();
+        }
+        tail.push_back(format!(
+            "{}{}",
+            if is_stderr { "stderr: " } else { "" },
+            line
+        ));
         if echo {
             if is_stderr {
                 eprintln!("{line}");
@@ -470,12 +497,16 @@ fn run_ppl(
 
     let status = child.wait().context("waiting for llama-perplexity")?;
     if !status.success() {
-        bail!("llama-perplexity exited with {status}");
+        bail!(
+            "llama-perplexity exited with {status}. Last output:\n{}",
+            tail.into_iter().collect::<Vec<_>>().join("\n")
+        );
     }
     ppl.with_context(|| {
         format!(
-            "no 'PPL =' line in llama-perplexity output for {}",
-            model.display()
+            "no 'PPL =' line in llama-perplexity output for {}. Last output:\n{}",
+            model.display(),
+            tail.into_iter().collect::<Vec<_>>().join("\n")
         )
     })
 }
@@ -494,12 +525,14 @@ fn fits_in_ram(preset: Preset, params: u64, available_ram: u64) -> bool {
     preset.estimate_bytes(params) <= (available_ram as f64 * 0.85) as u64
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_compress(
     model: &str,
     preset: PresetArg,
     out: Option<PathBuf>,
     imatrix: Option<PathBuf>,
     calibration: Option<PathBuf>,
+    quality_file: Option<PathBuf>,
     threads: Option<usize>,
     force: bool,
 ) -> Result<()> {
@@ -510,6 +543,9 @@ fn cmd_compress(
     }
     if let Some(im) = imatrix.as_ref().filter(|p| !p.is_file()) {
         bail!("importance matrix {} does not exist", im.display());
+    }
+    if let Some(file) = quality_file.as_ref().filter(|p| !p.is_file()) {
+        bail!("quality evaluation file {} does not exist", file.display());
     }
     if !detector::is_gguf(&input)? {
         bail!(
@@ -545,6 +581,11 @@ fn cmd_compress(
         );
     }
 
+    let ppl_tool = quality_file
+        .as_ref()
+        .map(|_| quantizer::find_tool("llama-perplexity", "LLM_COMPRESS_PPL_BIN"))
+        .transpose()?;
+
     let estimate = preset.estimate_bytes(meta.param_count);
     if let Some(available) = disk_available(output_dir(&output)) {
         if estimate > available {
@@ -571,10 +612,11 @@ fn cmd_compress(
         format_bytes(estimate)
     );
 
+    let generated_imatrix = imatrix.is_none() && calibration.is_some();
     let imatrix_path = match (imatrix, calibration) {
         (Some(p), _) => Some(p),
         (None, Some(text)) => {
-            let p = output.with_extension("imatrix");
+            let p = temporary_imatrix_path(&output)?;
             println!(
                 "{} building importance matrix -> {}",
                 "step".cyan().bold(),
@@ -593,20 +635,71 @@ fn cmd_compress(
         preset.llama_name()
     );
 
-    let (before, after) =
-        quantizer::compress(&input, &output, preset, imatrix_path.as_deref(), threads)?;
+    let compression =
+        quantizer::compress(&input, &output, preset, imatrix_path.as_deref(), threads);
+    if generated_imatrix {
+        if let Some(path) = imatrix_path.as_ref() {
+            if let Err(error) = fs::remove_file(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "warning: could not remove temporary imatrix {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    let (before, after) = compression?;
     let ratio = if before > 0 {
         after as f64 / before as f64 * 100.0
     } else {
         0.0
     };
+    let size_change = if after <= before {
+        format!("saved {}", format_bytes(before - after))
+    } else {
+        format!("grew by {}", format_bytes(after - before))
+    };
     println!(
-        "{} {} -> {} ({:.1}% of original)",
+        "{} {} -> {} ({:.1}% of original, {})",
         "done".green().bold(),
         format_bytes(before),
         format_bytes(after),
-        ratio
+        ratio,
+        size_change
     );
+
+    if let (Some(file), Some(tool)) = (quality_file.as_ref(), ppl_tool.as_ref()) {
+        println!(
+            "{} evaluating perplexity on {}",
+            "quality".cyan().bold(),
+            file.display()
+        );
+        let original_ppl = run_ppl(tool, &input, file, Some(threads), None, None, false)
+            .with_context(|| {
+                format!(
+                    "measuring source-model perplexity; quantized output is saved at {}",
+                    output.display()
+                )
+            })?;
+        let quantized_ppl = run_ppl(tool, &output, file, Some(threads), None, None, false)
+            .with_context(|| {
+                format!(
+                    "measuring quantized-model perplexity; quantized output is saved at {}",
+                    output.display()
+                )
+            })?;
+        let delta_pct = if original_ppl > 0.0 {
+            (quantized_ppl - original_ppl) / original_ppl * 100.0
+        } else {
+            f64::NAN
+        };
+        println!("  Source PPL    : {original_ppl:.4}");
+        println!("  Quantized PPL : {quantized_ppl:.4}");
+        if delta_pct.is_finite() {
+            println!("  PPL change    : {delta_pct:+.2}% (positive means higher perplexity)");
+        }
+    }
     Ok(())
 }
 
@@ -792,10 +885,16 @@ fn progress_bar(total: Option<u64>) -> Result<ProgressBar> {
     Ok(bar)
 }
 
-fn cmd_run(model: &str, threads: Option<usize>) -> Result<()> {
+fn cmd_run(model: &str, threads: Option<usize>, context: Option<u32>, predict: u32) -> Result<()> {
     let path = resolve_model(model)?;
-    let n = engine::init_thread_pool(threads)?;
-    engine::run_repl(&path, n)
+    if context == Some(0) {
+        bail!("--context must be greater than zero");
+    }
+    if predict == 0 {
+        bail!("--predict must be greater than zero");
+    }
+    let n = threads.unwrap_or_else(engine::default_threads).max(1);
+    llama_backend::run_repl(&path, n, context, predict)
 }
 
 fn cmd_status(json: bool) -> Result<()> {
@@ -871,11 +970,6 @@ fn cmd_doctor(json: bool) -> Result<()> {
             "llama-imatrix",
             "LLM_COMPRESS_IMATRIX_BIN",
             "Importance matrix calibration",
-        ),
-        (
-            "llama-cli",
-            "LLM_COMPRESS_CLI_BIN",
-            "Interactive chat & token generation",
         ),
         (
             "llama-bench",
@@ -1072,6 +1166,28 @@ fn output_dir(output: &Path) -> &Path {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
+}
+
+fn temporary_imatrix_path(output: &Path) -> Result<PathBuf> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = output
+        .file_name()
+        .context("output path has no file name")?
+        .to_string_lossy();
+    let pid = std::process::id();
+    for attempt in 0..100u32 {
+        let candidate = parent.join(format!(".{name}.{pid}.{attempt}.imatrix.dat.tmp"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "could not allocate a temporary imatrix path beside {}",
+        output.display()
+    )
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {

@@ -4,20 +4,18 @@
 //!   whole model never has to fit in resident memory at once.
 //! - Q4_0 dot-product kernels: AVX2/FMA with runtime detection, plus a scalar fallback.
 //! - `matvec_q4_0` parallelizes output rows across a rayon pool.
-//! - `run_repl` drives token generation through llama-cli, which runs the full forward pass.
+//! - In-process model loading and generation are provided by `llama_backend`.
 
 #![allow(dead_code)]
 
 use std::fs::File;
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 use memmap2::Mmap;
 use rayon::prelude::*;
 
 use crate::detector::{read_gguf_meta, GgufMeta};
-use crate::quantizer::find_tool;
 
 /// Q4_0 packs 32 weights per block: a 2-byte f16 scale followed by 16 bytes of nibbles.
 pub const QK4_0: usize = 32;
@@ -508,43 +506,6 @@ pub fn apply_rope(vec: &mut [f32], pos: usize, head_dim: usize, theta_base: f32)
             head[i] = v0 * fcr - v1 * fci;
             head[i + 1] = v0 * fci + v1 * fcr;
         }
-    }
-    Ok(())
-}
-
-/// Start an interactive session. Token generation is delegated to llama-cli,
-/// which runs the full transformer forward pass. Kernels in this module serve
-/// as the native path for benchmarking and for future in-process inference.
-pub fn run_repl(model: &Path, threads: usize) -> Result<()> {
-    let mapped = MappedModel::open(model)?;
-    let arch = mapped
-        .meta
-        .architecture
-        .clone()
-        .unwrap_or_else(|| "unknown".into());
-    let quant = mapped.meta.quant_name();
-    let version = mapped.meta.version;
-    let tensors = mapped.meta.tensor_count;
-    println!(
-        "loaded {} (gguf v{version}, arch: {arch}, quant: {quant}, tensors: {tensors}, kernel: {:?}, threads: {threads})",
-        model.display(),
-        detect_kernel()
-    );
-    // Release our mapping before the child process loads its own copy.
-    drop(mapped);
-
-    let cli = find_tool("llama-cli", "LLM_COMPRESS_CLI_BIN")?;
-    let status = Command::new(&cli)
-        .arg("-m")
-        .arg(model)
-        .arg("-t")
-        .arg(threads.to_string())
-        .arg("-cnv") // interactive conversation mode
-        .status()
-        .with_context(|| format!("launching {}", cli.display()))?;
-
-    if !status.success() {
-        bail!("llama-cli exited with {status}");
     }
     Ok(())
 }

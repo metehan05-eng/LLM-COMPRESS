@@ -56,6 +56,10 @@ pub enum Command {
         #[arg(long, value_name = "TEXT_FILE")]
         calibration: Option<PathBuf>,
 
+        /// Evaluate original and quantized perplexity on this text after compression.
+        #[arg(long, value_name = "TEXT_FILE")]
+        quality_file: Option<PathBuf>,
+
         /// Overwrite the output file if it already exists.
         #[arg(long)]
         force: bool,
@@ -172,7 +176,7 @@ pub enum Command {
         json: bool,
     },
 
-    /// Memory-map a model and start an interactive chat session.
+    /// Load a GGUF model through llama.cpp and start an interactive chat session.
     Run {
         /// Model file path, or a name as shown by `scan`.
         #[arg(long, value_name = "PATH_OR_NAME")]
@@ -181,6 +185,14 @@ pub enum Command {
         /// Worker threads. Defaults to the logical CPU count.
         #[arg(long, env = "LLM_COMPRESS_THREADS")]
         threads: Option<usize>,
+
+        /// Context length. Defaults to the model's training context.
+        #[arg(long, value_name = "TOKENS")]
+        context: Option<u32>,
+
+        /// Maximum number of new tokens per reply.
+        #[arg(long, default_value_t = 128, value_name = "TOKENS")]
+        predict: u32,
     },
 
     /// Show RAM, CPU architecture, SIMD support, and free disk space.

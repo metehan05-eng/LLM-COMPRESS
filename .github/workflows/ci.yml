@@ -23,6 +23,18 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Build llama.cpp
+        run: |
+          git clone --depth 1 --branch b8681 https://github.com/ggml-org/llama.cpp "$RUNNER_TEMP/llama.cpp"
+          cmake -S "$RUNNER_TEMP/llama.cpp" -B "$RUNNER_TEMP/llama.cpp/build" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DLLAMA_CURL=OFF \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF
+          cmake --build "$RUNNER_TEMP/llama.cpp/build" --config Release -j "$(nproc)"
+          echo "LLM_COMPRESS_LLAMA_LIB_DIR=$RUNNER_TEMP/llama.cpp/build/bin" >> "$GITHUB_ENV"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy

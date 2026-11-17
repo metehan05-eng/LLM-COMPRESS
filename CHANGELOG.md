@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `compress --quality-file` to compare source and quantized-model perplexity on the same corpus.
 - `info` command that prints GGUF metadata and the full tensor table, with
   per-tensor type and approximate size.
 - `estimate` command that projects output sizes for every preset and whether
@@ -31,6 +32,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- `run` now links to llama.cpp's shared C library and performs GGUF model loading,
+  tokenization, chat-template formatting, and generation in-process. Added
+  `--context` and `--predict` controls; `llama-cli` is no longer needed for chat.
+- The build locates `libllama` and `libggml` in standard library directories or
+  the llama.cpp path set by `LLM_COMPRESS_LLAMA_LIB_DIR`; plugin backends load at
+  startup.
+- Quantization writes to a temporary sibling GGUF, validates its metadata and parameter count, then moves it into place. Failed or invalid outputs are removed, and generated imatrix files are cleaned up.
+- Compression summaries report both size ratio and bytes saved (or growth).
 - `compress` now validates inputs before launching llama.cpp: it rejects
   identical input/output paths, missing calibration/imatrix files, and existing
   outputs unless `--force` is passed, and it checks free disk space against a

@@ -576,11 +576,16 @@ pub fn read_gguf_meta(path: &Path) -> Result<GgufMeta> {
         for _ in 0..n_dims {
             let dim = read_u64(&mut r)?;
             dims.push(dim);
-            elements = elements.saturating_mul(dim);
+            elements = elements
+                .checked_mul(dim)
+                .context("tensor dimension product overflows u64")?;
         }
         let ggml_type = read_u32(&mut r)?;
         let offset = read_u64(&mut r)?;
-        meta.param_count = meta.param_count.saturating_add(elements);
+        meta.param_count = meta
+            .param_count
+            .checked_add(elements)
+            .context("GGUF parameter count overflows u64")?;
         meta.tensors.push(TensorInfo {
             name,
             dims,
@@ -593,14 +598,67 @@ pub fn read_gguf_meta(path: &Path) -> Result<GgufMeta> {
     let header_end = r
         .stream_position()
         .context("reading the GGUF header position")?;
-    let alignment = meta
-        .ints
-        .get("general.alignment")
-        .copied()
-        .filter(|value| *value > 0 && *value <= (1 << 20))
-        .unwrap_or(32) as u64;
+    let alignment = match meta.ints.get("general.alignment").copied() {
+        Some(value) if (1..=(1 << 20)).contains(&value) => value as u64,
+        Some(value) => bail!("invalid GGUF general.alignment value {value}"),
+        None => 32,
+    };
     meta.alignment = alignment as u32;
-    meta.data_offset = header_end + (alignment - header_end % alignment) % alignment;
+    meta.data_offset = header_end
+        .checked_add((alignment - header_end % alignment) % alignment)
+        .context("GGUF data section offset overflows")?;
+
+    let file_len = r
+        .get_ref()
+        .metadata()
+        .context("reading GGUF file size")?
+        .len();
+    if !meta.tensors.is_empty() && meta.data_offset > file_len {
+        bail!(
+            "GGUF header ends at byte {} but aligned tensor data starts at byte {}, beyond file size {}",
+            header_end,
+            meta.data_offset,
+            file_len
+        );
+    }
+
+    for tensor in &meta.tensors {
+        if tensor.offset % alignment != 0 {
+            bail!(
+                "tensor '{}' has unaligned offset {} (alignment {})",
+                tensor.name,
+                tensor.offset,
+                alignment
+            );
+        }
+        let start = meta
+            .data_offset
+            .checked_add(tensor.offset)
+            .with_context(|| format!("tensor '{}' data offset overflows", tensor.name))?;
+        if start > file_len || (start == file_len && tensor.elements > 0) {
+            bail!(
+                "tensor '{}' starts at byte {}, beyond GGUF file size {}",
+                tensor.name,
+                start,
+                file_len
+            );
+        }
+
+        if let Some(size) = tensor_data_size_bytes(tensor.ggml_type, &tensor.dims)? {
+            let end = start
+                .checked_add(size)
+                .with_context(|| format!("tensor '{}' data range overflows", tensor.name))?;
+            if end > file_len {
+                bail!(
+                    "tensor '{}' data range {}..{} exceeds GGUF file size {}",
+                    tensor.name,
+                    start,
+                    end,
+                    file_len
+                );
+            }
+        }
+    }
 
     Ok(meta)
 }
@@ -766,7 +824,33 @@ pub fn ggml_type_name(ty: u32) -> &'static str {
 
 /// Approximate on-disk size of a tensor with `elements` weights of type `ty`.
 pub fn tensor_size_bytes(ty: u32, elements: u64) -> Option<u64> {
-    let (block, bytes) = match ty {
+    let (block, bytes) = tensor_type_block_size(ty)?;
+    let blocks = elements.div_ceil(block);
+    Some(blocks.saturating_mul(bytes))
+}
+
+/// Compute a tensor's encoded byte size, rounding quantized blocks per row.
+/// Returns `None` for GGML types not yet known to this version of the scanner.
+fn tensor_data_size_bytes(ty: u32, dims: &[u64]) -> Result<Option<u64>> {
+    let Some((block, bytes)) = tensor_type_block_size(ty) else {
+        return Ok(None);
+    };
+    let row_width = dims.first().copied().unwrap_or(1);
+    let row_count = dims
+        .iter()
+        .skip(1)
+        .try_fold(1u64, |n, dim| n.checked_mul(*dim))
+        .context("tensor row count overflows u64")?;
+    let row_blocks = row_width.div_ceil(block);
+    let size = row_blocks
+        .checked_mul(bytes)
+        .and_then(|n| n.checked_mul(row_count))
+        .context("tensor encoded size overflows u64")?;
+    Ok(Some(size))
+}
+
+fn tensor_type_block_size(ty: u32) -> Option<(u64, u64)> {
+    Some(match ty {
         0 => (1, 4),      // F32
         1 | 30 => (1, 2), // F16, BF16
         2 => (32, 18),    // Q4_0
@@ -796,9 +880,7 @@ pub fn tensor_size_bytes(ty: u32, elements: u64) -> Option<u64> {
         28 => (1, 8),     // F64
         29 => (256, 56),  // IQ1_M
         _ => return None,
-    };
-    let blocks = elements.div_ceil(block);
-    Some(blocks.saturating_mul(bytes))
+    })
 }
 
 #[cfg(test)]

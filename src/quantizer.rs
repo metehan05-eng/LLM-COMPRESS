@@ -47,6 +47,10 @@ pub fn build_imatrix(
     out: &Path,
     threads: usize,
 ) -> Result<PathBuf> {
+    if let Some(parent) = out.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating imatrix directory {}", parent.display()))?;
+    }
     let tool = find_tool("llama-imatrix", "LLM_COMPRESS_IMATRIX_BIN")?;
 
     let spinner = ProgressBar::new_spinner();
@@ -64,12 +68,35 @@ pub fn build_imatrix(
         .arg(threads.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .status()
-        .with_context(|| format!("launching {}", tool.display()))?;
+        .status();
 
     spinner.finish_and_clear();
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = fs::remove_file(out);
+            return Err(error).with_context(|| format!("launching {}", tool.display()));
+        }
+    };
     if !status.success() {
+        let _ = fs::remove_file(out);
         bail!("llama-imatrix failed with {status}");
+    }
+    let metadata = match fs::metadata(out) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = fs::remove_file(out);
+            return Err(error).with_context(|| {
+                format!(
+                    "llama-imatrix reported success but {} is missing",
+                    out.display()
+                )
+            });
+        }
+    };
+    if metadata.len() == 0 {
+        let _ = fs::remove_file(out);
+        bail!("llama-imatrix produced an empty file at {}", out.display());
     }
     Ok(out.to_path_buf())
 }
@@ -89,18 +116,18 @@ pub fn compress(
             input.display()
         );
     }
-    if let Ok(meta) = crate::detector::read_gguf_meta(input) {
-        if let Some(ft) = meta.file_type {
-            // llama.cpp strictly requires unquantized float models: F32 (0), F16 (1), or BF16 (28)
-            if ft != 0 && ft != 1 && ft != 28 {
-                let current_quant = meta.quant_name();
-                bail!(
-                    "cannot quantize already-quantized model '{}' ({current_quant}).\n\
-                     llama.cpp requires an unquantized source model (f16, bf16, or f32) as the input for quantization \
-                     because re-quantizing an already quantized model (like {current_quant}) severely degrades quality and is disabled by llama.cpp.",
-                    input.display()
-                );
-            }
+    let input_meta = crate::detector::read_gguf_meta(input)
+        .with_context(|| format!("validating input GGUF {}", input.display()))?;
+    if let Some(ft) = input_meta.file_type {
+        // llama.cpp strictly requires unquantized float models: F32 (0), F16 (1), or BF16 (28)
+        if ft != 0 && ft != 1 && ft != 28 {
+            let current_quant = input_meta.quant_name();
+            bail!(
+                "cannot quantize already-quantized model '{}' ({current_quant}).\n\
+                 llama.cpp requires an unquantized source model (f16, bf16, or f32) as the input for quantization \
+                 because re-quantizing an already quantized model (like {current_quant}) severely degrades quality and is disabled by llama.cpp.",
+                input.display()
+            );
         }
     }
     if preset == Preset::Iq3Xxs && imatrix.is_none() {
@@ -113,70 +140,120 @@ pub fn compress(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating output directory {}", parent.display()))?;
     }
-
-    let tool = find_tool("llama-quantize", "LLM_COMPRESS_QUANTIZE_BIN")?;
-    let mut cmd = Command::new(&tool);
-    if let Some(im) = imatrix {
-        cmd.arg("--imatrix").arg(im);
-    }
-    cmd.arg(input)
-        .arg(output)
-        .arg(preset.llama_name())
-        .arg(threads.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("launching {}", tool.display()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("capturing llama-quantize output")?;
-
-    let bar = ProgressBar::new(0);
-    bar.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} tensors  {elapsed_precise}",
-        )?
-        .progress_chars("=>-"),
-    );
-
-    // Keep the last lines so a failure can be explained.
-    let mut tail: VecDeque<String> = VecDeque::with_capacity(20);
-    for line in BufReader::new(stdout).lines() {
-        let line = line.context("reading llama-quantize output")?;
-        if let Some((done, total)) = parse_progress(&line) {
-            bar.set_length(total);
-            bar.set_position(done);
+    let staging = staging_path(output)?;
+    let result = (|| -> Result<(u64, u64)> {
+        let tool = find_tool("llama-quantize", "LLM_COMPRESS_QUANTIZE_BIN")?;
+        let mut cmd = Command::new(&tool);
+        if let Some(im) = imatrix {
+            cmd.arg("--imatrix").arg(im);
         }
-        if tail.len() == 20 {
-            tail.pop_front();
-        }
-        tail.push_back(line);
-    }
+        cmd.arg(input)
+            .arg(&staging)
+            .arg(preset.llama_name())
+            .arg(threads.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
 
-    let status = child.wait().context("waiting for llama-quantize")?;
-    bar.finish_and_clear();
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("launching {}", tool.display()))?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("could not capture llama-quantize output");
+            }
+        };
 
-    if !status.success() {
-        let _ = fs::remove_file(output);
-        bail!(
-            "llama-quantize failed with {status}. Last output:\n{}",
-            tail.into_iter().collect::<Vec<_>>().join("\n")
+        let bar = ProgressBar::new(0);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} tensors  {elapsed_precise}",
+            )?
+            .progress_chars("=>-"),
         );
-    }
 
-    let before = fs::metadata(input)?.len();
-    let after = fs::metadata(output)
-        .with_context(|| {
-            format!(
-                "llama-quantize reported success but {} is missing",
-                output.display()
-            )
-        })?
-        .len();
-    Ok((before, after))
+        // Keep the last lines so a failure can be explained.
+        let mut tail: VecDeque<String> = VecDeque::with_capacity(20);
+        let mut read_error = None;
+        for line in BufReader::new(stdout).lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    read_error = Some(error);
+                    let _ = child.kill();
+                    break;
+                }
+            };
+            if let Some((done, total)) = parse_progress(&line) {
+                bar.set_length(total);
+                bar.set_position(done);
+            }
+            if tail.len() == 20 {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+
+        let status = child.wait().context("waiting for llama-quantize")?;
+        bar.finish_and_clear();
+        if let Some(error) = read_error {
+            return Err(error).context("reading llama-quantize output");
+        }
+        if !status.success() {
+            bail!(
+                "llama-quantize failed with {status}. Last output:\n{}",
+                tail.into_iter().collect::<Vec<_>>().join("\n")
+            );
+        }
+
+        let output_meta = crate::detector::read_gguf_meta(&staging)
+            .with_context(|| format!("validating quantized output {}", staging.display()))?;
+        if output_meta.param_count != input_meta.param_count {
+            bail!(
+                "quantized output has {} parameters; expected {} from the input",
+                output_meta.param_count,
+                input_meta.param_count
+            );
+        }
+
+        let before = fs::metadata(input)?.len();
+        let after = fs::metadata(&staging)
+            .with_context(|| format!("quantized output {} is missing", staging.display()))?
+            .len();
+        fs::rename(&staging, output).with_context(|| {
+            format!("could not move validated output into {}", output.display())
+        })?;
+        Ok((before, after))
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+    result
+}
+
+fn staging_path(output: &Path) -> Result<PathBuf> {
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = output
+        .file_name()
+        .context("output path has no file name")?
+        .to_string_lossy();
+    let pid = std::process::id();
+    for attempt in 0..100u32 {
+        let candidate = parent.join(format!(".{name}.{pid}.{attempt}.partial.gguf.tmp"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "could not allocate a temporary output path beside {}",
+        output.display()
+    )
 }
 
 /// Parses llama-quantize progress lines of the form `[  12/ 291] ...`.

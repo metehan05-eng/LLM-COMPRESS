@@ -55,7 +55,9 @@ fn minimal_gguf() -> Vec<u8> {
     push_u32(&mut buf, 2); // Q4_0
     push_u64(&mut buf, 0);
 
-    buf.extend_from_slice(&[0u8; 64]);
+    // Header alignment puts the data section at byte 256; this Q4_0 tensor
+    // needs 288 bytes (16 blocks of 18 bytes each).
+    buf.extend_from_slice(&[0u8; 320]);
     buf
 }
 
